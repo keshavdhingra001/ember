@@ -83,11 +83,14 @@ fn embed_matches_cpu_exactly() {
             &format!("embed T={}", ids.len()),
             &cpu::embed(&wte, &wpe, ids).unwrap(),
             Tol::EXACT,
-            || g.read(&ops::embed(g, &gwte, &gwpe, ids).unwrap()).unwrap(),
+            || {
+                g.read(&ops::embed(g, &gwte, &gwpe, ids, 0).unwrap())
+                    .unwrap()
+            },
         );
     }
-    assert!(ops::embed(g, &gwte, &gwpe, &[37]).is_err());
-    assert!(ops::embed(g, &gwte, &gwpe, &[0; 17]).is_err());
+    assert!(ops::embed(g, &gwte, &gwpe, &[37], 0).is_err());
+    assert!(ops::embed(g, &gwte, &gwpe, &[0; 17], 0).is_err());
 }
 
 // ------------------------------------------------------------------ softmax
@@ -334,4 +337,91 @@ fn row_copies_exactly() {
         assert_eq!(r.data(), &x.data()[i * 7..(i + 1) * 7]);
     }
     assert!(ops::row(g, &gx, 4).is_err());
+}
+
+// ------------------------------------------------------------------ KV cache (M4)
+
+/// Rows `lo..hi` of a 2-D host tensor.
+fn rows(x: &Tensor, lo: usize, hi: usize) -> Tensor {
+    let c = x.shape()[1];
+    Tensor::new(&[hi - lo, c], x.data()[lo * c..hi * c].to_vec()).unwrap()
+}
+
+#[test]
+fn kv_write_fills_exactly_its_rows() {
+    // The cache starts full of a sentinel; rows outside start..start+T must keep it (D9: a
+    // stray write past the intended rows would otherwise go unseen).
+    let g = gpu();
+    let (t, e, n_ctx, start) = (5, 12, 9, 2);
+    let qkv = random(&[t, 3 * e], -1.0, 1.0, 61);
+    let sentinel = Tensor::new(&[n_ctx, e], vec![7.5; n_ctx * e]).unwrap();
+    let (k, v) = (g.upload(&sentinel), g.upload(&sentinel));
+    ops::kv_write(g, &g.upload(&qkv), &k, &v, start).unwrap();
+    let (k, v) = (g.read(&k).unwrap(), g.read(&v).unwrap());
+    for r in 0..n_ctx {
+        for c in 0..e {
+            let (want_k, want_v) = if (start..start + t).contains(&r) {
+                let q = qkv.data();
+                let base = (r - start) * 3 * e;
+                (q[base + e + c], q[base + 2 * e + c])
+            } else {
+                (7.5, 7.5)
+            };
+            assert_eq!(k.data()[r * e + c], want_k, "k[{r}, {c}]");
+            assert_eq!(v.data()[r * e + c], want_v, "v[{r}, {c}]");
+        }
+    }
+    // Past the end of the cache.
+    let (k, v) = (g.upload(&sentinel), g.upload(&sentinel));
+    assert!(ops::kv_write(g, &g.upload(&qkv), &k, &v, 5).is_err());
+}
+
+#[test]
+fn cached_attention_continues_exactly() {
+    // Cache a prefix, then attend the rest at an offset: the rows must match the CPU and be
+    // bitwise equal to attending the whole sequence at once (D31, D33).
+    let g = gpu();
+    let (t, h, e) = (70, 3, 12);
+    let qkv = random(&[t, 3 * e], -2.0, 2.0, 62);
+    let want = cpu::causal_attention(&qkv, h).unwrap();
+    let whole = g
+        .read(&ops::causal_attention(g, &g.upload(&qkv), h).unwrap())
+        .unwrap();
+    for split in [1, 33, 64, 69] {
+        let cache = Tensor::zeros(&[t + 5, e]); // longer than needed, like a real cache
+        let (k, v) = (g.upload(&cache), g.upload(&cache));
+        let first = g.upload(&rows(&qkv, 0, split));
+        let rest = g.upload(&rows(&qkv, split, t));
+        ops::kv_write(g, &first, &k, &v, 0).unwrap();
+        ops::kv_write(g, &rest, &k, &v, split).unwrap();
+        let got = g
+            .read(&ops::attention_cached(g, &rest, &k, &v, split, h).unwrap())
+            .unwrap();
+        let tail = rows(&want, split, t);
+        check(got.data(), tail.data(), ATTENTION_TOL)
+            .unwrap_or_else(|m| panic!("split {split}: {m}"));
+        let whole_tail = rows(&whole, split, t);
+        let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(got.data()), bits(whole_tail.data()), "split {split}");
+    }
+    // Asking for positions the cache doesn't have.
+    let small = g.upload(&Tensor::zeros(&[10, e]));
+    let q = g.upload(&rows(&qkv, 0, 3));
+    assert!(ops::attention_cached(g, &q, &small, &small, 8, h).is_err());
+}
+
+#[test]
+fn embed_at_an_offset() {
+    let g = gpu();
+    let (v, e, n_ctx) = (37, 12, 16);
+    let wte = random(&[v, e], -1.0, 1.0, 63);
+    let wpe = random(&[n_ctx, e], -1.0, 1.0, 64);
+    let ids = [3, 1, 4, 1, 5, 9, 2, 6];
+    let want = cpu::embed(&wte, &wpe, &ids).unwrap();
+    let (gwte, gwpe) = (g.upload(&wte), g.upload(&wpe));
+    let got = g
+        .read(&ops::embed(g, &gwte, &gwpe, &ids[5..], 5).unwrap())
+        .unwrap();
+    assert_eq!(got.data(), rows(&want, 5, 8).data());
+    assert!(ops::embed(g, &gwte, &gwpe, &ids[..2], 15).is_err());
 }

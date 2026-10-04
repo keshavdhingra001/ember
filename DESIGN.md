@@ -342,3 +342,53 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   rates fall as sequences grow. This is not a fair "GPU vs CPU" claim yet: naive kernels
   (D19, D20), ~160 queue submits per step (D25), and a per-step readback. M4 (KV cache) and M5
   (per-kernel timings) are where real numbers start.
+
+## M4: KV cache and incremental decode (owner approved the table 2026-10-05)
+
+### D30: KV cache layout
+- **What:** per layer, a K buffer and a V buffer of `[n_ctx, E]`: row = absolute position, heads
+  side by side (head h owns columns `h*D..(h+1)*D`), the same layout as the K and V thirds of a
+  `qkv` row. Allocated once at full context: 12 × 2 × 1024 × 768 × 4 B = 75.5 MB for GPT-2 124M.
+- **Alternatives:** grow per token; head-major `[H, n_ctx, D]`.
+- **Why:** fixed buffers mean no reallocation or copying as the sequence grows, and one layout
+  for `qkv` and cache keeps the indexing identical in both. Head-major gives each head a
+  contiguous `[n_ctx, D]` block, which a fused kernel (M7) may want. That's decided there, with
+  measurements.
+
+### D31: One attention kernel for prefill and decode
+- **What:** the M2 kernel now takes queries from `qkv` rows and keys/values from the cache. Query
+  row i sits at absolute position `start + i` and attends cache rows `0..=start+i`. Prefill is
+  `start = 0` with T rows; a decode step is `start = t` with 1 row. `ops::causal_attention` (the
+  M2 op) becomes "write a temporary cache, then attend", so its tests still cover the kernel.
+- **Alternatives:** a separate decode kernel.
+- **Why:** one kernel to test and reason about. Decode with one query row is exactly prefill's
+  last row, which is what makes D33's bitwise check possible.
+
+### D32: `kv_write` kernel
+- **What:** scatters the K and V columns of `qkv: [T, 3E]` into cache rows `start..start+T`. The
+  host checks `start + T <= n_ctx`. The positional embedding takes the same `start` (`ops::embed`).
+- **Why:** prefill writes T rows per layer in one dispatch instead of 2T buffer copies.
+
+### D33: Decode is checked bitwise against full recompute
+- **What:** at every step, the cached path's next-token logits must have the same *bits* as the
+  uncached GPU forward pass on the same prefix. Greedy output on the 4 golden continuations must
+  be identical too.
+- **Alternatives:** a tolerance.
+- **Why:** every kernel computes a row the same way whatever else is in the batch (D27), and
+  cached K/V rows are exactly the rows full recompute would produce. So any difference is a bug:
+  a wrong position, a stale or misplaced cache row, an off-by-one in `start`. A tolerance could
+  hide an off-by-one whose logits happen to be close.
+
+### D34: The CPU reference stays full-recompute
+- **Why:** the oracle checks *what* the model computes. D33 already checks the cache against full
+  recompute, which the CPU oracle checks in turn. A cached CPU path would add code to the
+  oracle that nothing needs.
+
+### D35: Prefill and decode are measured separately
+- **What:** `ember bench`: 1 warm-up run, then 5 measured runs; report the median prefill
+  latency (prompt → first logits) and the median decode rate (tokens/s over n steps), wall
+  clock, with prompt and output lengths stated. The uncached rate is measured the same way for
+  comparison.
+- **Why:** prefill is a batch of matrix-matrix products (compute-bound); decode is one row per
+  step, matrix-vector (memory-bound). One mixed tokens/s hides both. Medians resist the
+  occasional slow run; the warm-up excludes pipeline and driver first-use costs.

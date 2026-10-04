@@ -25,6 +25,7 @@ pub(crate) struct Kernels {
     pub layer_norm: wgpu::ComputePipeline,
     pub linear: wgpu::ComputePipeline,
     pub attention: wgpu::ComputePipeline,
+    pub kv_write: wgpu::ComputePipeline,
 }
 
 impl Gpu {
@@ -66,6 +67,7 @@ impl Gpu {
             layer_norm: k("layer_norm", include_str!("shaders/layer_norm.wgsl")),
             linear: k("linear", include_str!("shaders/linear.wgsl")),
             attention: k("attention", include_str!("shaders/attention.wgsl")),
+            kv_write: k("kv_write", include_str!("shaders/kv_write.wgsl")),
         };
         Ok(Gpu {
             device,

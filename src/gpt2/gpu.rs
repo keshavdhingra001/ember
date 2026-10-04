@@ -80,7 +80,7 @@ pub fn hidden(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<GpuTensor> {
         return Err(crate::Error::Input("empty token sequence".into()));
     }
     let eps = w.config.ln_eps;
-    let mut x = ops::embed(gpu, &w.wte, &w.wpe, ids)?;
+    let mut x = ops::embed(gpu, &w.wte, &w.wpe, ids, 0)?;
     for b in &w.blocks {
         let h = ops::layer_norm(gpu, &x, &b.ln_1.gain, &b.ln_1.bias, eps)?;
         let qkv = ops::linear(gpu, &h, &b.qkv.w, Some(&b.qkv.b))?;

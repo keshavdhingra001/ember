@@ -1,12 +1,13 @@
-// out[t, c] = wte[ids[t], c] + wpe[t, c]: a gather from the token table plus the position row.
+// out[t, c] = wte[ids[t], c] + wpe[start + t, c]: a gather from the token table plus the row of
+// the token's absolute position (start > 0 when decoding after a KV-cached prefix, D32).
 // One invocation per output element, grid-stride (D8). The host has already checked every id
-// is < V and T <= n_ctx: a shader can't report an error, only produce wrong numbers.
+// is < V and start + T <= n_ctx: a shader can't report an error, only produce wrong numbers.
 
 struct Params {
     n: u32,     // T * E
     e: u32,
-    _pad0: u32,
-    _pad1: u32,
+    start: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<storage, read> wte: array<f32>;
@@ -26,6 +27,6 @@ fn main(
     for (var i = gid.x; i < params.n; i += stride) {
         let t = i / params.e;
         let c = i % params.e;
-        out[i] = wte[ids[t] * params.e + c] + wpe[i];  // wpe row t, column c is index i
+        out[i] = wte[ids[t] * params.e + c] + wpe[params.start * params.e + i];  // row start + t, column c
     }
 }

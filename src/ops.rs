@@ -81,9 +81,16 @@ pub fn gelu(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
     Ok(out)
 }
 
-/// `out[t] = wte[ids[t]] + wpe[t]`. Ids and length are checked here: the kernel would
-/// silently read the wrong row (or a clamped one, D9).
-pub fn embed(gpu: &Gpu, wte: &GpuTensor, wpe: &GpuTensor, ids: &[u32]) -> Result<GpuTensor> {
+/// `out[t] = wte[ids[t]] + wpe[start + t]`: token embedding plus the embedding of its absolute
+/// position (`start` > 0 when decoding after a cached prefix, D32). Ids and positions are
+/// checked here: the kernel would silently read the wrong row (or a clamped one, D9).
+pub fn embed(
+    gpu: &Gpu,
+    wte: &GpuTensor,
+    wpe: &GpuTensor,
+    ids: &[u32],
+    start: usize,
+) -> Result<GpuTensor> {
     let (&[v, e], &[n_ctx, e2]) = (wte.shape(), wpe.shape()) else {
         return Err(Error::Shape(format!(
             "embed: wte {:?} and wpe {:?} must be 2-D",
@@ -98,10 +105,10 @@ pub fn embed(gpu: &Gpu, wte: &GpuTensor, wpe: &GpuTensor, ids: &[u32]) -> Result
             wpe.shape()
         )));
     }
-    if ids.len() > n_ctx {
+    if start + ids.len() > n_ctx {
         return Err(Error::Input(format!(
-            "{} tokens exceed the context length {n_ctx}",
-            ids.len()
+            "positions {start}..{} exceed the context length {n_ctx}",
+            start + ids.len()
         )));
     }
     if let Some(&bad) = ids.iter().find(|&&id| id as usize >= v) {
@@ -115,7 +122,7 @@ pub fn embed(gpu: &Gpu, wte: &GpuTensor, wpe: &GpuTensor, ids: &[u32]) -> Result
     }
     let n = len_u32(ids.len() * e)?;
     let ids_buf = gpu.upload_u32(ids);
-    let params = gpu.uniform(&Params4::new(n, e as u32, 0, 0));
+    let params = gpu.uniform(&Params4::new(n, e as u32, start as u32, 0));
     let groups = elementwise_groups(n as usize, gpu.limits.max_compute_workgroups_per_dimension);
     gpu.dispatch(
         &gpu.kernels.embed,
@@ -242,40 +249,135 @@ pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) ->
     Ok(out)
 }
 
-/// Causal multi-head attention from the fused `qkv: [T, 3E]`; returns `[T, E]`.
-pub fn causal_attention(gpu: &Gpu, qkv: &GpuTensor, n_head: usize) -> Result<GpuTensor> {
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AttentionParams {
+    t: u32,
+    e: u32,
+    d: u32,
+    scale: f32,
+    start: u32,
+    _pad: [u32; 3],
+}
+
+/// `[T, 3E]` -> `(T, E)`, checking that 3E splits into 3 x `n_head` heads.
+fn qkv_dims(op: &str, qkv: &GpuTensor, n_head: usize) -> Result<(usize, usize)> {
     let &[t, three_e] = qkv.shape() else {
         return Err(Error::Shape(format!(
-            "attention: qkv {:?} must be 2-D",
+            "{op}: qkv {:?} must be 2-D",
             qkv.shape()
         )));
     };
     if n_head == 0 || three_e % (3 * n_head) != 0 {
         return Err(Error::Shape(format!(
-            "attention: qkv {:?} doesn't split into 3 x {n_head} heads",
+            "{op}: qkv {:?} doesn't split into 3 x {n_head} heads",
             qkv.shape()
         )));
     }
-    if t > ATTENTION_MAX_CTX {
-        return Err(Error::Input(format!(
-            "attention: {t} positions exceed the kernel's {ATTENTION_MAX_CTX}"
+    len_u32(t * three_e)?;
+    Ok((t, three_e / 3))
+}
+
+/// `[n_ctx, E]` cache buffers for `start + T` positions of width `e`.
+fn check_cache(op: &str, k: &GpuTensor, v: &GpuTensor, e: usize, end: usize) -> Result<()> {
+    let &[rows, ke] = k.shape() else {
+        return Err(Error::Shape(format!(
+            "{op}: cache {:?} must be 2-D",
+            k.shape()
+        )));
+    };
+    if v.shape() != k.shape() || ke != e {
+        return Err(Error::Shape(format!(
+            "{op}: caches {:?} and {:?} for width {e}",
+            k.shape(),
+            v.shape()
         )));
     }
-    let e = three_e / 3;
-    let d = e / n_head;
+    if end > rows {
+        return Err(Error::Input(format!(
+            "{op}: positions up to {end} exceed the cache's {rows}"
+        )));
+    }
+    len_u32(rows * e)?;
+    Ok(())
+}
+
+/// Write the K and V thirds of `qkv: [T, 3E]` into cache rows `start..start + T` (D32).
+pub fn kv_write(
+    gpu: &Gpu,
+    qkv: &GpuTensor,
+    k_cache: &GpuTensor,
+    v_cache: &GpuTensor,
+    start: usize,
+) -> Result<()> {
+    let (t, e) = qkv_dims("kv_write", qkv, 1)?;
+    check_cache("kv_write", k_cache, v_cache, e, start + t)?;
+    if t == 0 || e == 0 {
+        return Ok(());
+    }
+    let n = (t * e) as u32;
+    let params = gpu.uniform(&Params4::new(n, e as u32, start as u32, 0));
+    let groups = elementwise_groups(n as usize, gpu.limits.max_compute_workgroups_per_dimension);
+    gpu.dispatch(
+        &gpu.kernels.kv_write,
+        &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer, &params],
+        (groups, 1, 1),
+    );
+    Ok(())
+}
+
+/// Attention for the queries in `qkv: [T, 3E]` at absolute positions `start..start + T`, over
+/// keys and values already in the cache (D31). Returns `[T, E]`.
+pub fn attention_cached(
+    gpu: &Gpu,
+    qkv: &GpuTensor,
+    k_cache: &GpuTensor,
+    v_cache: &GpuTensor,
+    start: usize,
+    n_head: usize,
+) -> Result<GpuTensor> {
+    let (t, e) = qkv_dims("attention", qkv, n_head)?;
+    check_cache("attention", k_cache, v_cache, e, start + t)?;
+    if start + t > ATTENTION_MAX_CTX {
+        return Err(Error::Input(format!(
+            "attention: {} positions exceed the kernel's {ATTENTION_MAX_CTX}",
+            start + t
+        )));
+    }
     let out = gpu.alloc(&[t, e]);
     if t == 0 {
         return Ok(out);
     }
-    len_u32(t * three_e)?;
-    let scale = 1.0 / (d as f32).sqrt();
-    let params = gpu.uniform(&Params4::new(t as u32, e as u32, d as u32, scale.to_bits()));
+    let d = e / n_head;
+    let params = gpu.uniform(&AttentionParams {
+        t: t as u32,
+        e: e as u32,
+        d: d as u32,
+        scale: 1.0 / (d as f32).sqrt(),
+        start: start as u32,
+        _pad: [0; 3],
+    });
     gpu.dispatch(
         &gpu.kernels.attention,
-        &[&qkv.buffer, &out.buffer, &params],
+        &[
+            &qkv.buffer,
+            &k_cache.buffer,
+            &v_cache.buffer,
+            &out.buffer,
+            &params,
+        ],
         (t as u32, n_head as u32, 1),
     );
     Ok(out)
+}
+
+/// Causal multi-head attention from the fused `qkv: [T, 3E]` alone; returns `[T, E]`. Writes a
+/// temporary `[T, E]` cache and attends over it: the M2 op, now a special case of D31.
+pub fn causal_attention(gpu: &Gpu, qkv: &GpuTensor, n_head: usize) -> Result<GpuTensor> {
+    let (t, e) = qkv_dims("attention", qkv, n_head)?;
+    let (k, v) = (gpu.alloc(&[t, e]), gpu.alloc(&[t, e]));
+    kv_write(gpu, qkv, &k, &v, 0)?;
+    attention_cached(gpu, qkv, &k, &v, 0, n_head)
 }
 
 /// Row `i` of `x: [R, C]` as a new `[1, C]` tensor: a buffer-to-buffer copy, no kernel (D26).
