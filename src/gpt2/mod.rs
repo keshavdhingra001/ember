@@ -1,7 +1,9 @@
-//! GPT-2 (124M and its larger siblings): config, weights, and the CPU reference forward pass.
+//! GPT-2 (124M and its larger siblings): config, weights, the CPU reference forward pass, and
+//! the same forward pass on the GPU (`gpu`).
 
 mod config;
 mod forward;
+pub mod gpu;
 mod weights;
 
 pub use config::Config;

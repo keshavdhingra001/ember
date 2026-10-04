@@ -64,12 +64,30 @@ pub fn generate_greedy(
     w: &Weights,
     prompt: &[u32],
     n: usize,
+    on_token: impl FnMut(u32),
+) -> Result<Vec<u32>> {
+    greedy(
+        prompt,
+        n,
+        w.config.n_ctx,
+        |ids| next_logits(w, ids),
+        on_token,
+    )
+}
+
+/// The greedy loop, shared by the CPU reference and the GPU model (`gpt2::gpu`): only
+/// `next_logits` differs between them.
+pub(crate) fn greedy(
+    prompt: &[u32],
+    n: usize,
+    n_ctx: usize,
+    mut next_logits: impl FnMut(&[u32]) -> Result<Vec<f32>>,
     mut on_token: impl FnMut(u32),
 ) -> Result<Vec<u32>> {
     let mut ids = prompt.to_vec();
     let mut out = Vec::with_capacity(n);
-    while out.len() < n && ids.len() < w.config.n_ctx {
-        let logits = next_logits(w, &ids)?;
+    while out.len() < n && ids.len() < n_ctx {
+        let logits = next_logits(&ids)?;
         let next = cpu::argmax(&logits)
             .ok_or_else(|| Error::Input("logits contain NaN; the model is broken".into()))?
             as u32;

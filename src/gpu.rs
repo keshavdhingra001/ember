@@ -160,6 +160,14 @@ impl Gpu {
         Tensor::new(&t.shape, data)
     }
 
+    /// Copy `size` bytes from `src` (starting at byte `offset`) to the start of `dst`, in queue
+    /// order after every earlier dispatch. Offsets and sizes must be multiples of 4.
+    pub(crate) fn copy(&self, src: &wgpu::Buffer, offset: u64, dst: &wgpu::Buffer, size: u64) {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(src, offset, dst, 0, size);
+        self.queue.submit([enc.finish()]);
+    }
+
     /// Record and submit one compute dispatch of `(x, y, z)` workgroups. Bindings are buffers
     /// in binding order.
     pub(crate) fn dispatch(

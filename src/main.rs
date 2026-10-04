@@ -1,5 +1,6 @@
 //! `ember` CLI: `info` (what GPU we got), `selftest` (GPU add vs the CPU reference),
-//! `tokenize` (GPT-2's BPE, step by step) and `generate` (greedy GPT-2 on the CPU reference).
+//! `tokenize` (GPT-2's BPE, step by step) and `generate` (greedy GPT-2 on the GPU, or on the
+//! CPU reference with `--cpu`).
 
 use std::io::Write;
 use std::path::Path;
@@ -7,12 +8,13 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ember::compare::{self, Tol};
+use ember::gpt2::gpu::{self as gpt2_gpu, GpuWeights};
 use ember::gpt2::{self, Weights};
 use ember::rng::Rng;
 use ember::{Gpu, Tensor, Tokenizer, cpu, ops};
 
 const USAGE: &str =
-    "usage: ember [info | selftest | tokenize <text> | generate [-n <tokens>] <prompt>]";
+    "usage: ember [info | selftest | tokenize <text> | generate [--cpu] [-n <tokens>] <prompt>]";
 const GPT2_DIR: &str = "data/gpt2";
 
 fn main() -> ExitCode {
@@ -103,9 +105,13 @@ fn tokenize(text: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Greedy GPT-2 on the CPU reference, streaming tokens as they come. Slow by design (no KV
-/// cache, naive matmul): it is the oracle, not the engine.
+/// Greedy GPT-2, streaming tokens as they come: on the GPU (D29), or on the CPU reference with
+/// `--cpu`. Both recompute the whole sequence every step until M4 adds a KV cache.
 fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (cpu_ref, args) = match args {
+        [flag, rest @ ..] if flag == "--cpu" => (true, rest),
+        _ => (false, args),
+    };
     let (n, prompt) = match args {
         [flag, n, rest @ ..] if flag == "-n" && !rest.is_empty() => (n.parse()?, rest.join(" ")),
         _ => (20, args.join(" ")),
@@ -115,19 +121,34 @@ fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let w = Weights::load(dir)?;
     let ids = tok.encode(&prompt)?;
 
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    let start = Instant::now();
     let mut pending = Vec::new();
-    let out = gpt2::generate_greedy(&w, &ids, n, |id| {
+    let on_token = |id: u32| {
         pending.extend_from_slice(tok.token_bytes(id).unwrap());
         print!("{}", take_utf8(&mut pending));
         let _ = std::io::stdout().flush();
-    })?;
+    };
+    let (out, secs, device) = if cpu_ref {
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        let start = Instant::now();
+        let out = gpt2::generate_greedy(&w, &ids, n, on_token)?;
+        (
+            out,
+            start.elapsed().as_secs_f64(),
+            "CPU reference".to_string(),
+        )
+    } else {
+        let gpu = Gpu::new()?;
+        let gw = GpuWeights::upload(&gpu, &w);
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        let start = Instant::now();
+        let out = gpt2_gpu::generate_greedy(&gpu, &gw, &ids, n, on_token)?;
+        (out, start.elapsed().as_secs_f64(), gpu.info.name.clone())
+    };
     println!("{}", String::from_utf8_lossy(&pending));
-    let secs = start.elapsed().as_secs_f64();
     eprintln!(
-        "[{} prompt + {} generated tokens in {secs:.1} s, {:.2} tokens/s; CPU reference, no KV cache]",
+        "[{} prompt + {} generated tokens in {secs:.2} s, {:.2} tokens/s; {device}, no KV cache]",
         ids.len(),
         out.len(),
         out.len() as f64 / secs

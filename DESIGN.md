@@ -319,6 +319,12 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   HF's published one.
 - **Why:** per-op tolerances (D22) compound over 12 layers. The end-to-end number shows how
   much, and identical greedy text shows it doesn't matter where it counts.
+- **Measured (2026-10-05):** tiny model 1.2e-6 abs. GPT-2 124M on 3 prompts: worst 2.1e-4 abs
+  on logits of magnitude ~100, 2.5e-6 relative; tolerance `abs 1e-4 + rel 1e-5`. The GPU is
+  closer to the CPU reference than the reference is to float64 numpy (9.5e-6). All 4 greedy
+  continuations are identical. Prefix rows, last-row logits and repeated runs are *bitwise*
+  equal on the GPU, as on the CPU, because every kernel computes a row the same way whatever
+  else is in the batch.
 
 ### D28: Readback only the next-token logits; argmax on the CPU
 - **What:** each generation step reads back `[1, V]` (201 KB) and runs `cpu::argmax`.
@@ -329,3 +335,10 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
 ### D29: `ember generate` runs on the GPU by default
 - **What:** `ember generate [--cpu] [-n N] <prompt>`; both paths print tokens/s labelled "no KV
   cache" until M4.
+- **First numbers (2026-10-05; wall clock from the first generated step to the last, weight
+  upload excluded; release build; one run each; prompt "I enjoy walking with my cute dog", 7
+  tokens + 40 generated):** GPU 1.86 tokens/s (21.5 s), CPU reference on 8 threads 1.20
+  tokens/s (33.4 s). Over 16 tokens: 3.18 vs 3.29. Without a KV cache step t costs O(t), so
+  rates fall as sequences grow. This is not a fair "GPU vs CPU" claim yet: naive kernels
+  (D19, D20), ~160 queue submits per step (D25), and a per-step readback. M4 (KV cache) and M5
+  (per-kernel timings) are where real numbers start.

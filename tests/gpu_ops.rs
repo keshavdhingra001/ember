@@ -320,3 +320,18 @@ fn attention_at_the_context_limit() {
     let too_long = g.upload(&Tensor::zeros(&[max + 1, 48]));
     assert!(ops::causal_attention(g, &too_long, 2).is_err());
 }
+
+// ------------------------------------------------------------------ row
+
+#[test]
+fn row_copies_exactly() {
+    let g = gpu();
+    let x = random(&[4, 7], -1.0, 1.0, 51);
+    let gx = g.upload(&x);
+    for i in 0..4 {
+        let r = g.read(&ops::row(g, &gx, i).unwrap()).unwrap();
+        assert_eq!(r.shape(), &[1, 7]);
+        assert_eq!(r.data(), &x.data()[i * 7..(i + 1) * 7]);
+    }
+    assert!(ops::row(g, &gx, 4).is_err());
+}

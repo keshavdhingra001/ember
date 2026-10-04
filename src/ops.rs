@@ -278,6 +278,21 @@ pub fn causal_attention(gpu: &Gpu, qkv: &GpuTensor, n_head: usize) -> Result<Gpu
     Ok(out)
 }
 
+/// Row `i` of `x: [R, C]` as a new `[1, C]` tensor: a buffer-to-buffer copy, no kernel (D26).
+pub fn row(gpu: &Gpu, x: &GpuTensor, i: usize) -> Result<GpuTensor> {
+    let &[r, c] = x.shape() else {
+        return Err(Error::Shape(format!("row: x {:?} must be 2-D", x.shape())));
+    };
+    if i >= r {
+        return Err(Error::Shape(format!("row {i} of a {r}-row tensor")));
+    }
+    let out = gpu.alloc(&[1, c]);
+    if c > 0 {
+        gpu.copy(&x.buffer, (i * c * 4) as u64, &out.buffer, (c * 4) as u64);
+    }
+    Ok(out)
+}
+
 /// Kernels index with u32 (WGSL has no 64-bit integers by default).
 fn len_u32(n: usize) -> Result<u32> {
     u32::try_from(n).map_err(|_| Error::Shape(format!("{n} elements exceed u32 indexing")))
