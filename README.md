@@ -4,11 +4,11 @@ An LLM inference engine on WebGPU, written in Rust with [wgpu](https://wgpu.rs) 
 shaders. It runs natively on Vulkan (developed on an Intel Iris Xe iGPU), and the plan is to run
 in the browser via wasm too.
 
-**Status:** M2 done: every GPT-2 op has a WGSL kernel (GELU, embedding, softmax, LayerNorm,
-naive matmul, causal attention) differential-tested against the CPU reference. M1's CPU reference
-loads GPT-2 124M, tokenizes with a hand-written BPE, and generates greedily, matching a float64
-numpy reference. Next: M3, the whole model on the GPU. See [CHECKPOINT.md](CHECKPOINT.md) for the roadmap and
-[DESIGN.md](DESIGN.md) for every design decision.
+**Status:** M3 done: GPT-2 124M runs end to end on the GPU (Intel Iris Xe, Vulkan), with logits
+within 2.5e-6 (relative) of a plain-Rust CPU reference and identical greedy text. The reference
+itself matches a float64 numpy implementation and Hugging Face's published output. Every kernel
+(GELU, embedding, softmax, LayerNorm, naive matmul, causal attention) is differential-tested
+against the reference. Next: M4, a KV cache.
 
 ## Approach
 - **CPU oracle.** A plain-Rust reference implementation of every op (and of the whole model) is
@@ -24,5 +24,6 @@ cargo run --release -- selftest   # GPU add on 1M floats vs the CPU reference
 cargo test
 scripts/fetch_gpt2.sh                                    # GPT-2 124M into data/gpt2/ (550 MB)
 cargo run --release -- tokenize "Hello world"            # BPE, step by step
-cargo run --release -- generate -n 16 "I enjoy walking with my cute dog"
+cargo run --release -- generate -n 16 "I enjoy walking with my cute dog"        # on the GPU
+cargo run --release -- generate --cpu -n 16 "I enjoy walking with my cute dog"  # CPU reference
 ```
