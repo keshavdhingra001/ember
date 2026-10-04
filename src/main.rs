@@ -1,19 +1,25 @@
-//! `ember` CLI. M0: `info` (what GPU we got) and `selftest` (GPU add vs the CPU reference).
+//! `ember` CLI: `info` (what GPU we got), `selftest` (GPU add vs the CPU reference), and
+//! `tokenize` (GPT-2's BPE, step by step).
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use ember::compare::{self, Tol};
 use ember::rng::Rng;
-use ember::{Gpu, Tensor, cpu, ops};
+use ember::{Gpu, Tensor, Tokenizer, cpu, ops};
+
+const USAGE: &str = "usage: ember [info | selftest | tokenize <text>]";
+const GPT2_DIR: &str = "data/gpt2";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         None | Some("info") => info(),
         Some("selftest") => selftest(),
+        Some("tokenize") if args.len() > 1 => tokenize(&args[1..].join(" ")),
         Some(other) => {
-            eprintln!("unknown command `{other}`\n\nusage: ember [info | selftest]");
+            eprintln!("unknown command or missing argument: `{other}`\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -68,5 +74,27 @@ fn selftest() -> Result<(), Box<dyn std::error::Error>> {
         stats.max_abs,
         elapsed.as_secs_f64() * 1e3
     );
+    Ok(())
+}
+
+/// Print each pre-split word and the tokens BPE made of it.
+fn tokenize(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let tok = Tokenizer::load(Path::new(GPT2_DIR))?;
+    let mut total = 0;
+    for word in tok.split(text)? {
+        let ids = tok.encode(word)?;
+        let pieces: Vec<String> = ids
+            .iter()
+            .map(|&id| {
+                format!(
+                    "{:?}={id}",
+                    String::from_utf8_lossy(tok.token_bytes(id).unwrap())
+                )
+            })
+            .collect();
+        println!("{word:?} -> {}", pieces.join(" "));
+        total += ids.len();
+    }
+    println!("{total} tokens");
     Ok(())
 }

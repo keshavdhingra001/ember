@@ -121,6 +121,15 @@ kernel (`add`) checked against the CPU reference with the tolerance comparator, 
   pre-split, then repeatedly merging the lowest-rank adjacent pair.
 - **Alternatives:** Hugging Face's `tokenizers` crate.
 - **Why:** it's heavy and hides the algorithm, and the tokenizer is a likely interview question.
+- **Details:** the pre-split regex is OpenAI's pattern verbatim, run by `fancy-regex` because
+  `\s+(?!\S)` needs look-ahead, which the `regex` crate deliberately lacks. Merges work on token
+  ids, `(left, right) -> (rank, merged)`, rather than on strings, so there is no string building
+  in the inner loop. Each round merges the lowest-rank pair at every position, left to right, as
+  `encoder.py` does. `<|endoftext|>` in the input is plain text, as in OpenAI's encoder; Hugging
+  Face maps it to id 50256 instead. Verified against Hugging Face `tokenizers` 0.23.2 on 23
+  strings covering contractions (both cases), whitespace runs, CRLF, NBSP, `\x1c`–`\x1f` and
+  `\x85`, combining marks, CJK, emoji ZWJ sequences, and the empty string
+  (`tests/fixtures/gpt2_tokenizer_cases.json`).
 
 ### D12: Pinned reference outputs from a numpy-only script (owner approved 2026-10-05, M1)
 - **What:** a one-off Python script that uses only `numpy` (no torch, since PyPI is slow on this

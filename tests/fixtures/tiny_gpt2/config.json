@@ -1,0 +1,9 @@
+{
+ "activation_function": "gelu_new",
+ "layer_norm_epsilon": 1e-05,
+ "n_embd": 12,
+ "n_head": 3,
+ "n_layer": 2,
+ "n_positions": 16,
+ "vocab_size": 37
+}
