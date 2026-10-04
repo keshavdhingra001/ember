@@ -18,8 +18,9 @@ CPU reference forward pass (plain Rust f32) ──┘  oracle: every kernel and 
                                                  differential-tested against it (D3, D5)
 ```
 
-Today (M0): a headless wgpu device, host/GPU tensors, upload and readback, one elementwise
-kernel (`add`) checked against the CPU reference with the tolerance comparator, and `ember info`.
+Today (M1): the CPU reference GPT-2 end to end (safetensors loader, BPE tokenizer, forward
+pass, greedy generation, `ember generate`), matching a float64 numpy implementation. The
+GPU side is still M0's: a headless device, upload and readback, and one `add` kernel.
 
 ## Decisions
 
@@ -137,11 +138,33 @@ kernel (`add`) checked against the CPU reference with the tolerance comparator, 
   must match the logits to 1e-4.
 - **Alternatives:** hard-coding known greedy completions.
 - **Why:** text alone can match while the logits are wrong. Matching logits checks every layer.
+- **Details:** the script computes in float64 (the truth, as far as f32 is concerned) and
+  stores float32. It is written vectorized (whole-sequence matmuls, all heads at once,
+  `-inf` masking) so it shares little structure with the Rust loops. Two extra checks keep it
+  from being "the same author's bug twice". Token ids come from Hugging Face `tokenizers`
+  (installed in the venv next to numpy, a deviation from "numpy only"). And its greedy output
+  must reproduce the continuation Hugging Face published for "I enjoy walking with my cute dog";
+  the script refuses to write goldens otherwise.
+- **Measured (2026-10-05):** GPT-2 124M logits on 3 prompts (6, 10 and 21 tokens): worst
+  absolute error 6.4e-4 on logits of magnitude ~100, worst relative 1.0e-5. The tolerance is
+  `abs 1e-4 + rel 1e-4 × |want|`, so the relative term carries it, with 10× headroom. "Match to
+  1e-4" in the table therefore means relative: a 1e-4 absolute bound would fail on correct
+  code, because f32 accumulates about 1e-6 relative error per layer over 12 layers. Greedy
+  continuations match token for token; the smallest top-2 logit gap in them is 0.028, far above
+  the error. Tiny model: worst absolute error 1.2e-6 at tolerance 1e-5.
 
 ### D13: Reference matmul is a naive triple loop (owner approved 2026-10-05, M1)
 - **What:** row-major f32, weights transposed once at load (D7), no BLAS.
 - **Alternatives:** `ndarray` or BLAS.
 - **Why:** the oracle has to be obviously correct, and it's allowed to be slow.
+- **Measured (2026-10-05, wall clock, `ember generate`, release build, one core):** 0.60
+  tokens/s for a 7–23-token sequence with no KV cache. Each dot product is one serial f32
+  dependency chain, which can't vectorize without reordering the sum (changing the bits). Unoptimized
+  it is about 30× slower, so `[profile.test]` uses `opt-level = 3`. The GPT-2 greedy test
+  (52 steps, ~100 s) is `#[ignore]`d and runs with `cargo test -- --ignored`.
+- **Open (owner):** threading `linear` across output rows would give ~4–6× on this laptop and keep
+  every element's bits identical (each output is still one serial sum). Not done yet; it needs
+  the owner's call.
 
 ### D14: Model shape comes from config.json (owner approved 2026-10-05, M1)
 - **What:** `n_layer`, `n_head`, `n_embd`, `n_ctx` and `vocab_size` are read into a config struct.
@@ -150,8 +173,21 @@ kernel (`add`) checked against the CPU reference with the tolerance comparator, 
   the tiny test models (D15) would otherwise catch.
 
 ### D15: Tests run without the weights (owner approved 2026-10-05, M1)
-- **What:** unit tests use tiny random models (2 layers, 16 dims) built in code. Tests that need
-  the real weights skip with a message saying how to fetch them.
+- **What:** two tiny models with odd sizes, both 2 layers, 3 heads, E = 12, vocab 37, context 16.
+  `Weights::random` (seeded) feeds property tests: prefix rows are bitwise equal, token order
+  matters, `next_logits` equals the last row. A committed fixture
+  (`tests/fixtures/tiny_gpt2/`, 22 KB, written by the numpy script, including its `attn.bias`
+  buffers) is checked against float64 logits and a 12-token greedy continuation. So the whole
+  forward pass and the loader are tested on every `cargo test`, with no download. Tests that need
+  the real weights skip, with a message saying how to fetch them.
 - **Alternatives:** always requiring the weights.
 - **Why:** CI and fresh clones shouldn't need a 548 MB download, and tiny models with odd sizes catch
   indexing bugs that 768-wide tensors make hard to debug.
+
+### D16: Greedy decoding semantics (Claude, M1; owner review pending)
+- **What:** `argmax` returns the first index among equal maxima, and `None` if any logit is NaN
+  (generation then fails with an error). Generation stops early at the context length.
+  `<|endoftext|>` doesn't stop it: the caller asks for `n` tokens and gets `n`.
+- **Why:** first-max makes ties deterministic (D4) and matches `np.argmax`. NaN compares false
+  with everything, so a plain max loop starting on a NaN returns index 0 forever. A broken
+  model would then look like a model that likes token 0 (a test caught exactly that).

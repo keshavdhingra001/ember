@@ -396,6 +396,10 @@ mod tests {
         let mut short = 1000u64.to_le_bytes().to_vec();
         short.extend_from_slice(b"{}");
         assert!(err(short).contains("doesn't fit"));
+        // Off by one: the header runs exactly one byte past the end of the file.
+        let mut one_over = file("{}", &[]);
+        one_over[0] = 3;
+        assert!(err(one_over).contains("doesn't fit"));
         let mut huge = u64::MAX.to_le_bytes().to_vec();
         huge.extend_from_slice(b"{}");
         assert!(err(huge).contains("doesn't fit"));
@@ -429,6 +433,11 @@ mod tests {
             (
                 r#"{"x":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#,
                 "needs 8 bytes",
+            ),
+            // Too many bytes for the shape is as wrong as too few.
+            (
+                r#"{"x":{"dtype":"F32","shape":[],"data_offsets":[0,8]}}"#,
+                "needs 4 bytes",
             ),
             (
                 r#"{"x":{"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,4]}}"#,
