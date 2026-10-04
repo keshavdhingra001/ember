@@ -1,6 +1,7 @@
 //! `ember` CLI: `info` (what GPU we got), `selftest` (GPU add vs the CPU reference),
-//! `tokenize` (GPT-2's BPE, step by step) and `generate` (greedy GPT-2 on the GPU, or on the
-//! CPU reference with `--cpu`).
+//! `tokenize` (GPT-2's BPE, step by step), `generate` (greedy GPT-2 on the GPU with a KV cache,
+//! or without one, or on the CPU reference) and `bench` (prefill and decode timings, D35).
+//! Wall-clock timing lives here, in the CLI, never in the engine (D4).
 
 use std::io::Write;
 use std::path::Path;
@@ -8,13 +9,12 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ember::compare::{self, Tol};
-use ember::gpt2::gpu::{self as gpt2_gpu, GpuWeights};
+use ember::gpt2::gpu::{self as gpt2_gpu, GpuWeights, KvCache};
 use ember::gpt2::{self, Weights};
 use ember::rng::Rng;
 use ember::{Gpu, Tensor, Tokenizer, cpu, ops};
 
-const USAGE: &str =
-    "usage: ember [info | selftest | tokenize <text> | generate [--cpu] [-n <tokens>] <prompt>]";
+const USAGE: &str = "usage: ember [info | selftest | tokenize <text>\n              | generate [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [-n <tokens>] <prompt>]";
 const GPT2_DIR: &str = "data/gpt2";
 
 fn main() -> ExitCode {
@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         Some("selftest") => selftest(),
         Some("tokenize") if args.len() > 1 => tokenize(&args[1..].join(" ")),
         Some("generate") if args.len() > 1 => generate(&args[1..]),
+        Some("bench") if args.len() > 1 => bench(&args[1..]),
         Some(other) => {
             eprintln!("unknown command or missing argument: `{other}`\n\n{USAGE}");
             return ExitCode::from(2);
@@ -105,17 +106,20 @@ fn tokenize(text: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Greedy GPT-2, streaming tokens as they come: on the GPU (D29), or on the CPU reference with
-/// `--cpu`. Both recompute the whole sequence every step until M4 adds a KV cache.
+/// Greedy GPT-2, streaming tokens as they come: on the GPU with a KV cache (D29), on the GPU
+/// recomputing everything with `--no-cache` (M3), or on the CPU reference with `--cpu`.
 fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (cpu_ref, args) = match args {
-        [flag, rest @ ..] if flag == "--cpu" => (true, rest),
-        _ => (false, args),
-    };
-    let (n, prompt) = match args {
-        [flag, n, rest @ ..] if flag == "-n" && !rest.is_empty() => (n.parse()?, rest.join(" ")),
-        _ => (20, args.join(" ")),
-    };
+    let mut args = args;
+    let (mut cpu_ref, mut no_cache) = (false, false);
+    while let [flag, rest @ ..] = args {
+        match flag.as_str() {
+            "--cpu" => cpu_ref = true,
+            "--no-cache" => no_cache = true,
+            _ => break,
+        }
+        args = rest;
+    }
+    let (n, prompt) = parse_n(args, 20)?;
     let dir = Path::new(GPT2_DIR);
     let tok = Tokenizer::load(dir)?;
     let w = Weights::load(dir)?;
@@ -132,28 +136,105 @@ fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         std::io::stdout().flush()?;
         let start = Instant::now();
         let out = gpt2::generate_greedy(&w, &ids, n, on_token)?;
-        (
-            out,
-            start.elapsed().as_secs_f64(),
-            "CPU reference".to_string(),
-        )
+        let secs = start.elapsed().as_secs_f64();
+        (out, secs, "CPU reference, no KV cache".to_string())
     } else {
         let gpu = Gpu::new()?;
         let gw = GpuWeights::upload(&gpu, &w);
         print!("{prompt}");
         std::io::stdout().flush()?;
         let start = Instant::now();
-        let out = gpt2_gpu::generate_greedy(&gpu, &gw, &ids, n, on_token)?;
-        (out, start.elapsed().as_secs_f64(), gpu.info.name.clone())
+        let out = if no_cache {
+            gpt2_gpu::generate_greedy_uncached(&gpu, &gw, &ids, n, on_token)?
+        } else {
+            gpt2_gpu::generate_greedy(&gpu, &gw, &ids, n, on_token)?
+        };
+        let secs = start.elapsed().as_secs_f64();
+        let mode = if no_cache { "no KV cache" } else { "KV cache" };
+        (out, secs, format!("{}, {mode}", gpu.info.name))
     };
     println!("{}", String::from_utf8_lossy(&pending));
     eprintln!(
-        "[{} prompt + {} generated tokens in {secs:.2} s, {:.2} tokens/s; {device}, no KV cache]",
+        "[{} prompt + {} generated tokens in {secs:.2} s, {:.2} tokens/s incl. prefill; {device}]",
         ids.len(),
         out.len(),
         out.len() as f64 / secs
     );
     Ok(())
+}
+
+/// `[-n N] <words...>` -> (N, the words joined by spaces).
+fn parse_n(args: &[String], default: usize) -> Result<(usize, String), Box<dyn std::error::Error>> {
+    Ok(match args {
+        [flag, n, rest @ ..] if flag == "-n" && !rest.is_empty() => (n.parse()?, rest.join(" ")),
+        _ => (default, args.join(" ")),
+    })
+}
+
+/// `ember bench [-n N] <prompt>` (D35): prefill latency and decode rate with the KV cache, and
+/// the uncached rate for comparison. 1 warm-up run, then the median of 5, wall clock.
+fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    const RUNS: usize = 5;
+    let (n, prompt) = parse_n(args, 32)?;
+    let dir = Path::new(GPT2_DIR);
+    let tok = Tokenizer::load(dir)?;
+    let w = Weights::load(dir)?;
+    let ids = tok.encode(&prompt)?;
+    let gpu = Gpu::new()?;
+    let gw = GpuWeights::upload(&gpu, &w);
+    let mut cache = KvCache::new(&gpu, &w.config);
+    let argmax = |l: &[f32]| cpu::argmax(l).expect("logits contain NaN") as u32;
+
+    // One cached run: (prefill seconds, decode seconds for n tokens). The decode clock covers
+    // everything a real step does: the model, the 201 KB readback and the argmax.
+    let mut cached = || -> Result<(f64, f64), Box<dyn std::error::Error>> {
+        cache.clear();
+        let t0 = Instant::now();
+        let mut next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &ids)?);
+        let prefill = t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        for _ in 0..n {
+            next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next])?);
+        }
+        Ok((prefill, t1.elapsed().as_secs_f64()))
+    };
+    cached()?; // warm-up
+    let runs = (0..RUNS).map(|_| cached()).collect::<Result<Vec<_>, _>>()?;
+    let prefill = median(runs.iter().map(|r| r.0).collect());
+    let decode = median(runs.iter().map(|r| r.1).collect());
+
+    let uncached = || -> Result<f64, Box<dyn std::error::Error>> {
+        let t = Instant::now();
+        gpt2_gpu::generate_greedy_uncached(&gpu, &gw, &ids, n + 1, |_| {})?;
+        Ok(t.elapsed().as_secs_f64())
+    };
+    uncached()?;
+    let full = median((0..RUNS).map(|_| uncached()).collect::<Result<_, _>>()?);
+
+    println!(
+        "{} ({:?}); prompt {} tokens, {n} decode steps; median of {RUNS} after 1 warm-up, wall clock",
+        gpu.info.name,
+        gpu.info.backend,
+        ids.len()
+    );
+    println!("prefill            {:8.1} ms", prefill * 1e3);
+    println!(
+        "decode (KV cache)  {:8.1} ms/token  {:6.2} tokens/s",
+        decode * 1e3 / n as f64,
+        n as f64 / decode
+    );
+    println!(
+        "no cache (M3)      {:8.1} ms/token  {:6.2} tokens/s  (prompt + {} tokens, all recomputed)",
+        full * 1e3 / (n + 1) as f64,
+        (n + 1) as f64 / full,
+        n + 1
+    );
+    Ok(())
+}
+
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    xs[xs.len() / 2]
 }
 
 /// Remove and return the longest printable prefix of `buf`. A token can end halfway through a

@@ -392,3 +392,17 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
 - **Why:** prefill is a batch of matrix-matrix products (compute-bound); decode is one row per
   step, matrix-vector (memory-bound). One mixed tokens/s hides both. Medians resist the
   occasional slow run; the warm-up excludes pipeline and driver first-use costs.
+- **First results (2026-10-05, `ember bench -n 32 "I enjoy walking with my cute dog"`, Iris Xe /
+  Vulkan / Mesa 26.2.2, release build, prompt 7 tokens, 32 decode steps):**
+
+  | | Median |
+  |---|---|
+  | Prefill (7 tokens → first logits) | 134.7 ms |
+  | Decode with KV cache | 50.6 ms/token = **19.76 tokens/s** |
+  | No cache (M3, prompt + 33 tokens recomputed every step) | 462.9 ms/token = 2.16 tokens/s |
+
+  So the cache is 9.1× faster at this length, and the gap grows with length (uncached step t
+  costs O(t) of everything, cached only O(t) attention). A decode step reads all ~498 MB of
+  f32 weights once, so 50.6 ms means ~10 GB/s effective. This laptop's LPDDR4x peak is around
+  50–68 GB/s (unmeasured here; M6 measures the roofline), so naive decode reaches roughly a
+  fifth of it. That's the gap the uncoalesced matrix-vector reads (D19) leave for M6.

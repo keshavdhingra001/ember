@@ -4,11 +4,13 @@ An LLM inference engine on WebGPU, written in Rust with [wgpu](https://wgpu.rs) 
 shaders. It runs natively on Vulkan (developed on an Intel Iris Xe iGPU), and the plan is to run
 in the browser via wasm too.
 
-**Status:** M3 done: GPT-2 124M runs end to end on the GPU (Intel Iris Xe, Vulkan), with logits
-within 2.5e-6 (relative) of a plain-Rust CPU reference and identical greedy text. The reference
-itself matches a float64 numpy implementation and Hugging Face's published output. Every kernel
-(GELU, embedding, softmax, LayerNorm, naive matmul, causal attention) is differential-tested
-against the reference. Next: M4, a KV cache.
+**Status:** Tier 1 done (M0–M4): GPT-2 124M runs end to end on the GPU (Intel Iris Xe, Vulkan) with a
+KV cache, at **19.8 tokens/s decode** and 135 ms prefill for a 7-token prompt (`ember bench`,
+median of 5 after a warm-up, wall clock). Logits are within 2.5e-6 (relative) of a plain-Rust CPU
+reference, and greedy text is identical. Every cached decode step is bit-for-bit equal to
+recomputing the whole sequence. The reference itself matches a float64 numpy implementation and
+Hugging Face's published output. Every kernel is differential-tested against the reference.
+Next: M5, per-kernel GPU timings.
 
 ## Approach
 - **CPU oracle.** A plain-Rust reference implementation of every op (and of the whole model) is
@@ -26,4 +28,5 @@ scripts/fetch_gpt2.sh                                    # GPT-2 124M into data/
 cargo run --release -- tokenize "Hello world"            # BPE, step by step
 cargo run --release -- generate -n 16 "I enjoy walking with my cute dog"        # on the GPU
 cargo run --release -- generate --cpu -n 16 "I enjoy walking with my cute dog"  # CPU reference
+cargo run --release -- bench -n 32 "I enjoy walking with my cute dog"           # prefill / decode timings
 ```
