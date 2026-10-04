@@ -19,6 +19,12 @@ pub struct Gpu {
 /// milliseconds; doing it per call would dwarf the kernels themselves.
 pub(crate) struct Kernels {
     pub add: wgpu::ComputePipeline,
+    pub gelu: wgpu::ComputePipeline,
+    pub embed: wgpu::ComputePipeline,
+    pub softmax: wgpu::ComputePipeline,
+    pub layer_norm: wgpu::ComputePipeline,
+    pub linear: wgpu::ComputePipeline,
+    pub attention: wgpu::ComputePipeline,
 }
 
 impl Gpu {
@@ -51,8 +57,15 @@ impl Gpu {
             .await
             .map_err(|e| Error::Device(e.to_string()))?;
         let limits = device.limits();
+        let k = |name, src| compute_pipeline(&device, name, src);
         let kernels = Kernels {
-            add: compute_pipeline(&device, "add", include_str!("shaders/add.wgsl")),
+            add: k("add", include_str!("shaders/add.wgsl")),
+            gelu: k("gelu", include_str!("shaders/gelu.wgsl")),
+            embed: k("embed", include_str!("shaders/embed.wgsl")),
+            softmax: k("softmax", include_str!("shaders/softmax.wgsl")),
+            layer_norm: k("layer_norm", include_str!("shaders/layer_norm.wgsl")),
+            linear: k("linear", include_str!("shaders/linear.wgsl")),
+            attention: k("attention", include_str!("shaders/attention.wgsl")),
         };
         Ok(Gpu {
             device,
@@ -76,6 +89,18 @@ impl Gpu {
             shape: t.shape().to_vec(),
             buffer,
         }
+    }
+
+    /// A storage buffer of u32s (token ids). Not a `GpuTensor`: tensors are f32 (D7).
+    pub(crate) fn upload_u32(&self, data: &[u32]) -> wgpu::Buffer {
+        const ZERO: [u32; 1] = [0];
+        let data = if data.is_empty() { &ZERO[..] } else { data };
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("u32"),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
     }
 
     /// An uninitialised-by-us (wgpu zero-fills it) tensor for a kernel to write into.
@@ -135,12 +160,13 @@ impl Gpu {
         Tensor::new(&t.shape, data)
     }
 
-    /// Record and submit one compute dispatch. Bindings are buffers in binding order.
+    /// Record and submit one compute dispatch of `(x, y, z)` workgroups. Bindings are buffers
+    /// in binding order.
     pub(crate) fn dispatch(
         &self,
         pipeline: &wgpu::ComputePipeline,
         bindings: &[&wgpu::Buffer],
-        workgroups: u32,
+        (x, y, z): (u32, u32, u32),
     ) {
         let entries: Vec<wgpu::BindGroupEntry> = bindings
             .iter()
@@ -160,7 +186,7 @@ impl Gpu {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(x, y, z);
         }
         self.queue.submit([enc.finish()]);
     }
