@@ -97,3 +97,52 @@ kernel (`add`) checked against the CPU reference with the tolerance comparator, 
   platform it's an equivalent mutant. Once buffers are reused from an arena (M7) and hold more
   than `n` floats, the same bug would silently corrupt the neighbour. M7's tests must use
   oversized buffers with sentinel values to catch it.
+
+### D10: GPT-2 weights: safetensors, hand-parsed over mmap (owner approved 2026-10-05, M1)
+- **What:** `openai-community/gpt2` `model.safetensors` (548 MB) plus `config.json`, `vocab.json`
+  and `merges.txt` in `data/gpt2/` (git-ignored). A small hand-written parser reads the format
+  (u64 little-endian header length, a JSON header mapping names to dtype, shape and byte offsets,
+  then raw tensor bytes) over a `memmap2` mapping.
+- **Alternatives:** the `safetensors` crate; converting to a custom format.
+- **Why:** the format is simple enough to parse in about a page, and owning the parser means the
+  owner can explain exactly how bytes become tensors. mmap avoids copying 548 MB before it is needed.
+- **Details:** the JSON header itself is parsed with `serde_json` (JSON parsing is not the point).
+  The reader validates everything the header claims before trusting it: header length within the
+  file and under the format's 100 MB cap, known dtypes, `shape × dtype size == end - begin` with
+  overflow checks, and tensors that tile the data section exactly (no gaps, overlaps, or trailing
+  bytes). Values are decoded with `f32::from_le_bytes` because the data section starts at
+  `8 + N` and has no alignment guarantee. Conv1D weights (`[in, out]`) are transposed to
+  `[out, in]` at load (D7); the 12 `attn.bias` causal-mask buffers in the file are ignored.
+  `scripts/fetch_gpt2.sh` pins the checkpoint's sha256
+  (`248dfc39…d3a707`, same as Hugging Face's LFS hash).
+
+### D11: Tokenizer: hand-written byte-level BPE (owner approved 2026-10-05, M1)
+- **What:** GPT-2's algorithm from `vocab.json` + `merges.txt`: the bytes-to-unicode map, the regex
+  pre-split, then repeatedly merging the lowest-rank adjacent pair.
+- **Alternatives:** Hugging Face's `tokenizers` crate.
+- **Why:** it's heavy and hides the algorithm, and the tokenizer is a likely interview question.
+
+### D12: Pinned reference outputs from a numpy-only script (owner approved 2026-10-05, M1)
+- **What:** a one-off Python script that uses only `numpy` (no torch, since PyPI is slow on this
+  network) writes token ids and logits for 3 prompts to `data/gpt2/golden/`. The Rust reference
+  must match the logits to 1e-4.
+- **Alternatives:** hard-coding known greedy completions.
+- **Why:** text alone can match while the logits are wrong. Matching logits checks every layer.
+
+### D13: Reference matmul is a naive triple loop (owner approved 2026-10-05, M1)
+- **What:** row-major f32, weights transposed once at load (D7), no BLAS.
+- **Alternatives:** `ndarray` or BLAS.
+- **Why:** the oracle has to be obviously correct, and it's allowed to be slow.
+
+### D14: Model shape comes from config.json (owner approved 2026-10-05, M1)
+- **What:** `n_layer`, `n_head`, `n_embd`, `n_ctx` and `vocab_size` are read into a config struct.
+  No sizes are hard-coded.
+- **Why:** hard-coded constants would break for gpt2-medium/large, and they hide shape bugs that
+  the tiny test models (D15) would otherwise catch.
+
+### D15: Tests run without the weights (owner approved 2026-10-05, M1)
+- **What:** unit tests use tiny random models (2 layers, 16 dims) built in code. Tests that need
+  the real weights skip with a message saying how to fetch them.
+- **Alternatives:** always requiring the weights.
+- **Why:** CI and fresh clones shouldn't need a 548 MB download, and tiny models with odd sizes catch
+  indexing bugs that 768-wide tensors make hard to debug.
