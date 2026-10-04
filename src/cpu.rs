@@ -71,7 +71,12 @@ pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
 ///
 /// Two passes (mean first, then the mean of squared deviations) instead of `E[x^2] - E[x]^2`:
 /// GPT-2's residual stream has a few very large features, and subtracting two nearly equal
-/// large numbers in f32 would cancel away most of the variance's digits.
+/// large numbers would cancel away most of the variance's digits.
+///
+/// Computed in f64 and rounded to f32 once per output (D23). A serial f32 sum's rounding error
+/// grows with the row length, and the mean's error is then divided by the standard deviation;
+/// in f32 this oracle was less accurate than the GPU's tree sum (D22). The oracle should be the
+/// most accurate thing in the room.
 pub fn layer_norm(x: &Tensor, gain: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
     let &[t, e] = x.shape() else {
         return Err(Error::Shape(format!(
@@ -90,13 +95,14 @@ pub fn layer_norm(x: &Tensor, gain: &Tensor, bias: &Tensor, eps: f32) -> Result<
     let (g, b) = (gain.data(), bias.data());
     let mut out = Vec::with_capacity(t * e);
     for row in x.data().chunks_exact(e) {
-        let mean = row.iter().sum::<f32>() / e as f32;
-        let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / e as f32;
-        let inv_std = 1.0 / (var + eps).sqrt();
+        let n = e as f64;
+        let mean = row.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+        let inv_std = 1.0 / (var + eps as f64).sqrt();
         out.extend(
             row.iter()
                 .enumerate()
-                .map(|(j, v)| (v - mean) * inv_std * g[j] + b[j]),
+                .map(|(j, &v)| ((v as f64 - mean) * inv_std * g[j] as f64 + b[j] as f64) as f32),
         );
     }
     Tensor::new(x.shape(), out)

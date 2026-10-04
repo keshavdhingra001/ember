@@ -259,7 +259,7 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   | `add`, `embed` | exact | 0 | one IEEE add on both sides |
   | `gelu` | 1e-6, 1e-5 | 9.5e-7 abs | the drivers' `tanh` vs libm's |
   | `softmax_rows` | 1e-7, 1e-5 | 6.7e-8 abs | `exp`, tree vs serial sum; subnormals flushed to 0 |
-  | `layer_norm` | 1e-4, 1e-5 | 8.8e-5 abs | **the CPU's own error** (below) |
+  | `layer_norm` | 2e-5, 1e-5 (was 1e-4) | 5.7e-6 abs (was 8.8e-5) | tree sums, `sqrt`; before D23 mostly the CPU's own error |
   | `linear` | 1e-5, 1e-5 | 2.9e-6 abs (n_in 3072) | fused multiply-add: same order, one rounding per step |
   | `causal_attention` | 5e-6, 1e-4 | 7.8e-7 abs | dot products, `exp`, tree softmax |
 
@@ -268,9 +268,7 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   5.2e-5 off (3072 columns) and the GPU's tree sum 4.4e-6. A serial sum's rounding error grows
   with n; a tree's with log n. The error in the mean is then divided by the standard
   deviation. Headroom over the measured 8.8e-5 is small, but the inputs are seeded and the
-  kernel deterministic, so the test can't flake. **Open (owner):** accumulate the oracle's
-  LayerNorm sums in f64 (or pairwise). That would make the oracle the more accurate side and
-  allow ~1e-5 here. It changes M1's reference, so it's the owner's call.
+  kernel deterministic, so the test can't flake. Resolved by D23: the tolerance is now 2e-5.
 - **Mutation results (27 WGSL mutants):** 23 caught. The 4 survivors:
   - The three barrier removals (D18).
   - Removing gelu's clamp before `tanh`. Mesa's `tanh` already returns ±1 for large arguments, so
@@ -280,3 +278,54 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   Four "wrong max" mutants (softmax ×3, attention ×1) first survived. Softmax is invariant to
   the value subtracted, so a slightly wrong max only shows when `exp` overflows. Tests with one
   dominant logit (100 among ±5, positioned so each mutant misses it) now catch all four.
+
+### D23: The CPU LayerNorm computes in f64 (owner approved 2026-10-05)
+- **What:** mean, variance and every output of `cpu::layer_norm` are computed in f64 and
+  rounded to f32 once.
+- **Alternatives:** pairwise f32 summation; leaving the tolerance at 1e-4.
+- **Why:** D22 found the f32 oracle 12× *less* accurate than the GPU's tree sum. A tolerance
+  that mostly measures the oracle hides real kernel errors. In f64 the oracle's error is ~0.5 ulp,
+  so the GPU tolerance tightened from 1e-4 to 2e-5 (measured worst 5.7e-6). GPT-2 logits vs numpy
+  improved slightly: worst relative error 1.0e-5 → 9.5e-6. The other reductions (softmax, attention)
+  have small enough errors that they stay f32.
+
+## M3: GPT-2 on the GPU (owner approved the table 2026-10-05)
+
+### D24: Weights are uploaded once
+- **What:** `GpuWeights::upload(&Weights)` mirrors `Weights` with a `GpuTensor` per tensor,
+  ~498 MB of f32 (124M parameters). The Iris Xe shares system RAM, and the biggest single
+  binding (`wte`, 147 MiB) is under the 2047 MiB limit (D6).
+- **Why:** weights are read every token and never change; uploading per forward pass would make
+  PCIe/memcpy the bottleneck. f16 storage is a Tier 3 stretch.
+
+### D25: One queue submit per op (for now)
+- **What:** the GPU forward pass calls the M2 ops in order; each validates, dispatches and submits
+  on its own, and wgpu orders submissions on the queue. No readback until the logits.
+- **Alternatives:** one command encoder per forward pass.
+- **Why:** the ops stay independently testable with the signatures M2 tested. Submit
+  overhead is measured in M5, and M7 merges a token into one encoder.
+
+### D26: The LM head runs on the last row only during generation
+- **What:** `ops::row` copies one row into its own buffer with `copy_buffer_to_buffer` (no
+  kernel), and `linear` runs on `[1, E]`. The full `[T, V]` logits are only computed to compare
+  every position in tests.
+- **Why:** the LM head (`V × E` = 38.6M multiply-adds per row) is the single largest matmul;
+  only the last row matters for the next token.
+
+### D27: Correctness bar for M3
+- **What:** GPU logits are compared with the CPU reference (not the numpy goldens: the oracle is
+  the reference, D3) on the tiny model and the 3 golden prompts, with a tolerance measured and
+  recorded here. Greedy tokens must be identical on all 4 golden continuations, including
+  HF's published one.
+- **Why:** per-op tolerances (D22) compound over 12 layers. The end-to-end number shows how
+  much, and identical greedy text shows it doesn't matter where it counts.
+
+### D28: Readback only the next-token logits; argmax on the CPU
+- **What:** each generation step reads back `[1, V]` (201 KB) and runs `cpu::argmax`.
+- **Alternatives:** an argmax kernel (one more reduction), reading back 4 bytes.
+- **Why:** simplest correct thing; whether 201 KB of readback matters is a question for M5's
+  timings, not a guess.
+
+### D29: `ember generate` runs on the GPU by default
+- **What:** `ember generate [--cpu] [-n N] <prompt>`; both paths print tokens/s labelled "no KV
+  cache" until M4.

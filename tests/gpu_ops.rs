@@ -161,12 +161,11 @@ fn softmax_uses_the_true_row_max() {
 
 // ------------------------------------------------------------------ layer_norm
 
-/// Dominated by the *CPU's* error, not the GPU's: with inputs around 100 and a spread of ~3,
-/// the serial f32 sum gives a mean a few ulp off, and the error is divided by the std. Against a
-/// float64 LayerNorm (measured 2026-10-05, 3072 columns) the CPU was 5.2e-5 off and the GPU's
-/// tree sum 4.4e-6. See D22.
+/// Two tree sums vs the oracle's f64 sums (D23), and Vulkan's sqrt isn't correctly rounded.
+/// Measured worst 5.7e-6 (3072 columns, inputs around 100 with a spread of ~3). With the oracle
+/// in f32 it was 8.8e-5, mostly the oracle's own error (D22).
 const LAYER_NORM_TOL: Tol = Tol {
-    abs: 1e-4,
+    abs: 2e-5,
     rel: 1e-5,
 };
 
