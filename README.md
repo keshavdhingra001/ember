@@ -4,8 +4,10 @@ An LLM inference engine on WebGPU, written in Rust with [wgpu](https://wgpu.rs) 
 shaders. It runs natively on Vulkan (developed on an Intel Iris Xe iGPU), and the plan is to run
 in the browser via wasm too.
 
-**Status:** M1 (CPU reference GPT-2) done: loads GPT-2 124M from safetensors, tokenizes with a
-hand-written BPE, and generates greedily on the CPU, matching a float64 numpy reference. See [CHECKPOINT.md](CHECKPOINT.md) for the roadmap and
+**Status:** M2 done: every GPT-2 op has a WGSL kernel (GELU, embedding, softmax, LayerNorm,
+naive matmul, causal attention) differential-tested against the CPU reference. M1's CPU reference
+loads GPT-2 124M, tokenizes with a hand-written BPE, and generates greedily, matching a float64
+numpy reference. Next: M3, the whole model on the GPU. See [CHECKPOINT.md](CHECKPOINT.md) for the roadmap and
 [DESIGN.md](DESIGN.md) for every design decision.
 
 ## Approach

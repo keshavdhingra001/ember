@@ -136,6 +136,29 @@ fn softmax_large_logits_dont_overflow() {
     );
 }
 
+#[test]
+fn softmax_uses_the_true_row_max() {
+    // Softmax is invariant to the value subtracted, so a slightly wrong max is invisible. It
+    // only shows when exp overflows: one logit of 100 among values in +-5 needs the max to be
+    // exactly that logit, or exp(~95) = inf and the row turns to NaN. The spike positions are
+    // chosen so each way of getting the max wrong misses them: index 301 belongs to thread 45
+    // (odd, so not in the even half of the tree) and is not the last element that thread folds.
+    let g = gpu();
+    let cols = 1000;
+    let mut x = random(&[3, cols], -5.0, 5.0, 31).data().to_vec();
+    for (row, spike) in [301, 2, 640].into_iter().enumerate() {
+        x[row * cols + spike] = 100.0;
+    }
+    let x = Tensor::new(&[3, cols], x).unwrap();
+    let gx = g.upload(&x);
+    compare(
+        "softmax one dominant logit",
+        &cpu::softmax_rows(&x).unwrap(),
+        SOFTMAX_TOL,
+        || g.read(&ops::softmax_rows(g, &gx).unwrap()).unwrap(),
+    );
+}
+
 // ------------------------------------------------------------------ layer_norm
 
 /// Dominated by the *CPU's* error, not the GPU's: with inputs around 100 and a spread of ~3,
@@ -259,6 +282,28 @@ fn attention_matches_cpu() {
             || g.read(&ops::causal_attention(g, &gq, h).unwrap()).unwrap(),
         );
     }
+}
+
+#[test]
+fn attention_uses_the_true_score_max() {
+    // As for softmax: key 5 scores ~113 for every query of head 0 (q = 4, k = 10 over d = 8
+    // dims, / sqrt(8)) while the others score at most ~11. A max that misses key 5 (thread 5)
+    // makes exp overflow to inf and the output NaN.
+    let g = gpu();
+    let (t, h, e) = (100, 2, 16);
+    let mut qkv = random(&[t, 3 * e], -1.0, 1.0, 41).data().to_vec();
+    for i in 0..t {
+        qkv[i * 3 * e..][..8].fill(4.0); // head 0 of Q
+    }
+    qkv[5 * 3 * e + e..][..8].fill(10.0); // head 0 of K at position 5
+    let qkv = Tensor::new(&[t, 3 * e], qkv).unwrap();
+    let gq = g.upload(&qkv);
+    compare(
+        "attention one dominant key",
+        &cpu::causal_attention(&qkv, h).unwrap(),
+        ATTENTION_TOL,
+        || g.read(&ops::causal_attention(g, &gq, h).unwrap()).unwrap(),
+    );
 }
 
 #[test]

@@ -214,6 +214,12 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   walk 768 or 50257 elements alone. Float atomics don't exist in WebGPU, and their ordering would
   break determinism anyway (D4). The fixed tree gives the same bits every run. Its order differs
   from the CPU's serial sum, which is why reductions get a nonzero tolerance (D22).
+- **Barriers can't be proven by tests.** Removing any of the three "read before overwrite" or
+  "write before read" barriers (softmax, layer_norm, attention) leaves every test passing on the
+  Iris Xe. Its SIMD groups within a workgroup run nearly in step, so the race window never
+  opens. A race-free test run says nothing about another GPU (M10 runs these kernels in a
+  browser on other hardware). So every barrier carries a comment naming the write and read it
+  orders. Those three surviving mutants are recorded in D22.
 
 ### D19: Naive matmul: one thread per output element
 - **What:** `linear` dispatches 16×16 workgroups over (output feature, row). Each thread does the
@@ -246,3 +252,31 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
 - **Why:** sources of difference vary by op: none (add), `tanh`/`exp` implementations (gelu,
   softmax), summation order (reductions), fused multiply-add (linear). One global tolerance
   would be either too loose for the exact ops or failing for the reductions.
+- **Measured (2026-10-05, Iris Xe, Mesa 26.2.2), worst over each op's test shapes:**
+
+  | Op | Tolerance (abs, rel) | Worst measured | Main source of difference |
+  |---|---|---|---|
+  | `add`, `embed` | exact | 0 | one IEEE add on both sides |
+  | `gelu` | 1e-6, 1e-5 | 9.5e-7 abs | the drivers' `tanh` vs libm's |
+  | `softmax_rows` | 1e-7, 1e-5 | 6.7e-8 abs | `exp`, tree vs serial sum; subnormals flushed to 0 |
+  | `layer_norm` | 1e-4, 1e-5 | 8.8e-5 abs | **the CPU's own error** (below) |
+  | `linear` | 1e-5, 1e-5 | 2.9e-6 abs (n_in 3072) | fused multiply-add: same order, one rounding per step |
+  | `causal_attention` | 5e-6, 1e-4 | 7.8e-7 abs | dot products, `exp`, tree softmax |
+
+- **LayerNorm's tolerance measures the oracle, not the kernel.** Inputs around 100 with a spread
+  of ~3, like GPT-2's residual stream: against a float64 LayerNorm, the CPU's serial f32 sum is
+  5.2e-5 off (3072 columns) and the GPU's tree sum 4.4e-6. A serial sum's rounding error grows
+  with n; a tree's with log n. The error in the mean is then divided by the standard
+  deviation. Headroom over the measured 8.8e-5 is small, but the inputs are seeded and the
+  kernel deterministic, so the test can't flake. **Open (owner):** accumulate the oracle's
+  LayerNorm sums in f64 (or pairwise). That would make the oracle the more accurate side and
+  allow ~1e-5 here. It changes M1's reference, so it's the owner's call.
+- **Mutation results (27 WGSL mutants):** 23 caught. The 4 survivors:
+  - The three barrier removals (D18).
+  - Removing gelu's clamp before `tanh`. Mesa's `tanh` already returns ±1 for large arguments, so
+    on this driver the clamp is an equivalent mutant, like `i <= n` in D9. It stays for drivers
+    that compute tanh as `(e^2u - 1) / (e^2u + 1)` = inf / inf.
+
+  Four "wrong max" mutants (softmax ×3, attention ×1) first survived. Softmax is invariant to
+  the value subtracted, so a slightly wrong max only shows when `exp` overflows. Tests with one
+  dominant logit (100 among ±5, positioned so each mutant misses it) now catch all four.
