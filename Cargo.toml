@@ -10,3 +10,11 @@ memmap2 = "0.9.11"
 pollster = "1.0.1"
 serde_json = "1.0.151"
 wgpu = "30.0.1"
+
+# The CPU reference forward pass is a naive triple loop (D13): unoptimized it is ~30x slower,
+# too slow for the tests that run GPT-2 124M. Tests and dependencies are built optimized.
+[profile.test]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3
