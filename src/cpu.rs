@@ -13,6 +13,10 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 
 /// `y = x @ w^T + b`: `x: [T, in]`, `w: [out, in]` (D7), `b: [out]` or none. The naive triple
 /// loop (D13); each output is one dot product summed in index order, then the bias is added.
+///
+/// Big products are split across threads in contiguous chunks of the output. That changes who
+/// computes an element, never how: every element is still the same serial sum, so the bits
+/// are identical to the single-threaded loop (D4) regardless of the thread count.
 pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
     let (&[t, n_in], &[n_out, w_in]) = (x.shape(), w.shape()) else {
         return Err(Error::Shape(format!(
@@ -29,19 +33,35 @@ pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
             b.map(Tensor::shape)
         )));
     }
-    let (x, w) = (x.data(), w.data());
-    let mut out = vec![0.0; t * n_out];
-    for i in 0..t {
+    let (x, w, b) = (x.data(), w.data(), b.map(Tensor::data));
+    // Output element `idx` is row i = idx / n_out, feature o = idx % n_out.
+    let element = |idx: usize| {
+        let (i, o) = (idx / n_out, idx % n_out);
         let row = &x[i * n_in..(i + 1) * n_in];
-        for o in 0..n_out {
-            let w_row = &w[o * n_in..(o + 1) * n_in];
-            let mut acc = 0.0f32;
-            for k in 0..n_in {
-                acc += row[k] * w_row[k];
-            }
-            out[i * n_out + o] = acc + b.map_or(0.0, |b| b.data()[o]);
+        let w_row = &w[o * n_in..(o + 1) * n_in];
+        let mut acc = 0.0f32;
+        for k in 0..n_in {
+            acc += row[k] * w_row[k];
         }
-    }
+        acc + b.map_or(0.0, |b| b[o])
+    };
+    let mut out = vec![0.0; t * n_out];
+    // Below ~1M multiply-adds a thread costs more to start than it saves.
+    let threads = if t * n_out * n_in < 1 << 20 {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    };
+    let chunk = out.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (c, part) in out.chunks_mut(chunk).enumerate() {
+            s.spawn(move || {
+                for (j, y) in part.iter_mut().enumerate() {
+                    *y = element(c * chunk + j);
+                }
+            });
+        }
+    });
     Tensor::new(&[t, n_out], out)
 }
 
@@ -298,6 +318,32 @@ mod tests {
         // in = 3 vs w's in = 2; a bias of the wrong length.
         assert!(linear(&x, &t(&[3, 2], &[0.0; 6]), None).is_err());
         assert!(linear(&x, &w, Some(&t(&[3], &[0.0; 3]))).is_err());
+    }
+
+    #[test]
+    fn threaded_linear_is_bitwise_the_serial_loop() {
+        // Big enough to take the threaded path; compare against the textbook loop.
+        let mut rng = crate::rng::Rng::new(9);
+        let (t, n_in, n_out) = (5, 300, 701);
+        let x = Tensor::new(&[t, n_in], rng.vec(t * n_in, -1.0, 1.0)).unwrap();
+        let w = Tensor::new(&[n_out, n_in], rng.vec(n_out * n_in, -1.0, 1.0)).unwrap();
+        let b = Tensor::new(&[n_out], rng.vec(n_out, -1.0, 1.0)).unwrap();
+        assert!(t * n_out * n_in >= 1 << 20);
+        let got = linear(&x, &w, Some(&b)).unwrap();
+        for i in 0..t {
+            for o in 0..n_out {
+                let mut acc = 0.0f32;
+                for k in 0..n_in {
+                    acc += x.data()[i * n_in + k] * w.data()[o * n_in + k];
+                }
+                let want = acc + b.data()[o];
+                assert_eq!(
+                    got.data()[i * n_out + o].to_bits(),
+                    want.to_bits(),
+                    "({i}, {o})"
+                );
+            }
+        }
     }
 
     #[test]

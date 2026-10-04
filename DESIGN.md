@@ -40,7 +40,7 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   architecture. The Llama family (M8) then adds what interviews ask about now: RoPE, RMSNorm,
   SwiGLU, grouped-query attention, and quantized weights (M9). The U-Net is a Tier 3 stretch.
 
-### D3: The CPU reference is the oracle (Claude, M0; owner review pending)
+### D3: The CPU reference is the oracle (Claude, M0; owner confirmed 2026-10-05)
 - **What:** a plain, obviously correct Rust implementation of every op (and in M1 of the whole
   GPT-2 forward pass). Every GPU kernel is differential-tested against it on edge-case and random
   shapes. The reference is checked once against pinned outputs of the original model.
@@ -48,7 +48,7 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
 - **Why:** goldens only cover the inputs they were dumped for; an oracle covers any shape and any
   input, and points to the exact kernel that broke. Same idea as lob's reference book.
 
-### D4: Determinism (Claude, M0; owner review pending)
+### D4: Determinism (Claude, M0; owner confirmed 2026-10-05)
 - **What:** same device + same inputs gives bit-identical outputs. Kernels never use atomics on
   floats, reductions have a fixed order (fixed workgroup size, fixed tree), sampling takes a seed,
   and engine code never reads a clock (only the measurement module does).
@@ -56,7 +56,7 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   gives different bits run to run. Then a test failure can't be reproduced, and "did my change
   alter the output?" has no answer. Bit-identical across *different* GPUs is not promised (D5).
 
-### D5: Compare floats with explicit tolerances (Claude, M0; owner review pending)
+### D5: Compare floats with explicit tolerances (Claude, M0; owner confirmed 2026-10-05)
 - **What:** `compare::check(got, want, Tol { abs, rel })` passes when every element satisfies
   `|got - want| <= abs + rel * |want|`, and NaN or infinity mismatches always fail. On failure it
   reports the worst index, both values and the error.
@@ -66,7 +66,7 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   kernels; a mean would hide one broken element. Tolerances are set per op (exact ops such as `add`
   use 0) and any loosening gets a note here.
 
-### D6: Device setup (Claude, M0; owner review pending)
+### D6: Device setup (Claude, M0; owner confirmed 2026-10-05)
 - **What:** one headless device (no window surface), high-performance adapter preference,
   requesting the adapter's own limits instead of WebGPU defaults. Blocking API on native via
   `pollster`; the async core stays reachable for wasm later (M10).
@@ -74,14 +74,14 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   embedding is 50257 × 768 × 4 B = 147 MiB. Asking for what the adapter supports avoids splitting
   that tensor. `ember info` prints the limits we got.
 
-### D7: Tensor layout (Claude, M0; owner review pending)
+### D7: Tensor layout (Claude, M0; owner confirmed 2026-10-05)
 - **What:** contiguous row-major `f32`, shape kept on the host (`Vec<usize>`). A `GpuTensor` is a
   storage buffer plus its shape. No strides or views yet.
 - **Why:** every kernel indexes `row * cols + col` and nothing else, which keeps the WGSL readable.
   Transposes happen once at load time instead of through strided reads. f16 and quantized layouts
   arrive with their milestones (M7, M9).
 
-### D8: Elementwise dispatch with a grid-stride loop (Claude, M0; owner review pending)
+### D8: Elementwise dispatch with a grid-stride loop (Claude, M0; owner confirmed 2026-10-05)
 - **What:** workgroup size 256; dispatch `min(ceil(n / 256), 65535)` workgroups; each invocation
   loops `i += 256 * num_workgroups`.
 - **Alternatives:** one invocation per element with a 2D dispatch for large `n`.
@@ -89,7 +89,7 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   16.7M elements, and GPT-2's embedding has 38.6M. The loop handles any `n` with a 1D dispatch.
   256 is a multiple of every vendor's SIMD width (Intel 8/16/32, AMD 32/64, NVIDIA 32).
 
-### D9: Out-of-bounds accesses are contained, not trusted (Claude, M0; owner review pending)
+### D9: Out-of-bounds accesses are contained, not trusted (Claude, M0; owner confirmed 2026-10-05)
 - **What:** WebGPU guarantees that a shader can't read or write outside a bound buffer: wgpu adds
   bounds checks (or relies on Vulkan's robust buffer access), so an out-of-bounds write is dropped
   or clamped to the end of the buffer. Kernels still bounds-check by `params.n`, never by buffer size.
@@ -142,7 +142,8 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   stores float32. It is written vectorized (whole-sequence matmuls, all heads at once,
   `-inf` masking) so it shares little structure with the Rust loops. Two extra checks keep it
   from being "the same author's bug twice". Token ids come from Hugging Face `tokenizers`
-  (installed in the venv next to numpy, a deviation from "numpy only"). And its greedy output
+  (installed in the venv next to numpy, a deviation from "numpy only" that the owner
+  confirmed on 2026-10-05). And its greedy output
   must reproduce the continuation Hugging Face published for "I enjoy walking with my cute dog";
   the script refuses to write goldens otherwise.
 - **Measured (2026-10-05):** GPT-2 124M logits on 3 prompts (6, 10 and 21 tokens): worst
@@ -162,9 +163,11 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
   dependency chain, which can't vectorize without reordering the sum (changing the bits). Unoptimized
   it is about 30× slower, so `[profile.test]` uses `opt-level = 3`. The GPT-2 greedy test
   (52 steps, ~100 s) is `#[ignore]`d and runs with `cargo test -- --ignored`.
-- **Open (owner):** threading `linear` across output rows would give ~4–6× on this laptop and keep
-  every element's bits identical (each output is still one serial sum). Not done yet; it needs
-  the owner's call.
+- **Threaded (owner approved 2026-10-05):** `linear` splits big products (≥ 2^20 multiply-adds)
+  across `available_parallelism()` threads, in contiguous chunks of the output. Each element is
+  still one serial sum, so results are bitwise identical to the serial loop (a test compares
+  them bit for bit) and independent of the thread count. Measured the same way: 3.29 tokens/s
+  on 8 threads (5.5×). The GPT-2 greedy test is back in the default run (~24 s).
 
 ### D14: Model shape comes from config.json (owner approved 2026-10-05, M1)
 - **What:** `n_layer`, `n_head`, `n_embd`, `n_ctx` and `vocab_size` are read into a config struct.
@@ -184,10 +187,62 @@ GPU side is still M0's: a headless device, upload and readback, and one `add` ke
 - **Why:** CI and fresh clones shouldn't need a 548 MB download, and tiny models with odd sizes catch
   indexing bugs that 768-wide tensors make hard to debug.
 
-### D16: Greedy decoding semantics (Claude, M1; owner review pending)
+### D16: Greedy decoding semantics (Claude, M1; owner confirmed 2026-10-05)
 - **What:** `argmax` returns the first index among equal maxima, and `None` if any logit is NaN
   (generation then fails with an error). Generation stops early at the context length.
   `<|endoftext|>` doesn't stop it: the caller asks for `n` tokens and gets `n`.
 - **Why:** first-max makes ties deterministic (D4) and matches `np.argmax`. NaN compares false
   with everything, so a plain max loop starting on a NaN returns index 0 forever. A broken
   model would then look like a model that likes token 0 (a test caught exactly that).
+
+## M2: GPU kernels (owner approved the table 2026-10-05)
+
+### D17: Kernel order, simplest first
+- **What:** `gelu` (elementwise) → residual `add` (M0's kernel) → `embed` (gather) →
+  `softmax_rows` (row reduction) → `layer_norm` (two reductions per row) → naive `linear` →
+  causal attention. The bias add is fused into `linear` (one read of the output instead of two).
+- **Alternatives:** matmul first, since it is most of the time.
+- **Why:** each kernel adds one new idea (elementwise, gather, reduction, 2-D dispatch, a
+  reduction inside a gather). A failure then points at the new idea, not at five at once.
+
+### D18: Row reductions: one workgroup per row, fixed tree
+- **What:** 256 threads per row. Thread `i` sums elements `i, i+256, i+512, …` serially, then the
+  256 partial sums are combined in shared memory by a fixed halving tree (128, 64, …, 1) with a
+  `workgroupBarrier()` between levels.
+- **Alternatives:** one thread per row; atomics.
+- **Why:** a thread per row leaves the GPU mostly idle (T rows, often < 100) and makes each thread
+  walk 768 or 50257 elements alone. Float atomics don't exist in WebGPU, and their ordering would
+  break determinism anyway (D4). The fixed tree gives the same bits every run. Its order differs
+  from the CPU's serial sum, which is why reductions get a nonzero tolerance (D22).
+
+### D19: Naive matmul: one thread per output element
+- **What:** `linear` dispatches 16×16 workgroups over (output feature, row). Each thread does the
+  serial dot product of `x[i, :]` and `w[o, :]` (both contiguous, D7), then adds the bias.
+- **Alternatives:** tiling now.
+- **Why:** it is the baseline M6 is measured against, and its accumulation order matches the CPU's
+  exactly, so the only difference is fused multiply-add. `x` reads are shared by the 16 threads of
+  a row, `w` reads are not coalesced (neighbouring threads read rows `n_in` apart). That's
+  the known weakness M6 fixes.
+
+### D20: Naive attention: one workgroup per (head, query row)
+- **What:** dispatch `(T, H)` workgroups of 64 threads. Scores for keys `0..=t` go into a
+  shared-memory array of `n_ctx` floats (4 KiB for 1024), the max and sum use the fixed tree
+  (D18), then each thread produces output dimensions `c, c+64, …` as a serial weighted sum over j.
+- **Alternatives:** fused online softmax (FlashAttention), which is M7.
+- **Why:** it mirrors the CPU loop structure closely enough to debug, and it is causal for free:
+  keys after t are never scored. The shared array caps T at the compiled `MAX_CTX` (1024); the
+  op rejects longer inputs instead of corrupting memory.
+
+### D21: Kernel parameters in a 16-byte-aligned uniform per dispatch
+- **What:** every kernel takes its sizes in a small uniform struct (padded to a multiple of 16
+  bytes, as M0's `add`). Pipelines are compiled once in `Gpu::new` (M0, D6).
+- **Why:** sizes vary per call (T grows during generation), and uniforms are the WebGPU way to
+  pass a few scalars. Per-dispatch buffers are allocated for now; M7's arena removes that.
+
+### D22: Per-kernel tolerances, measured
+- **What:** each GPU op is compared to `cpu.rs` with its own `Tol`, set from the measured worst
+  error with headroom, and the measured value recorded in DESIGN.md. Every kernel is also run
+  twice and must produce identical bits (D4).
+- **Why:** sources of difference vary by op: none (add), `tanh`/`exp` implementations (gelu,
+  softmax), summation order (reductions), fused multiply-add (linear). One global tolerance
+  would be either too loose for the exact ops or failing for the reductions.

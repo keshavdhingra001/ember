@@ -77,10 +77,9 @@ fn gpt2_logits_match_numpy() {
     }
 }
 
-/// About 100 s: 52 greedy steps, each recomputing the whole sequence on one core (no KV cache
-/// until M4). Run with `cargo test -- --ignored`.
+/// 52 greedy steps, each recomputing the whole sequence (no KV cache until M4): the slowest
+/// test, ~20 s with the threaded `linear` (D13).
 #[test]
-#[ignore = "slow on the single-threaded CPU reference; run with --ignored"]
 fn gpt2_greedy_matches_numpy() {
     let Some(dir) = common::gpt2_golden_dir() else {
         return;
