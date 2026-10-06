@@ -57,8 +57,9 @@ pub fn next_logits(w: &Weights, ids: &[u32]) -> Result<Vec<f32>> {
     Ok(cpu::linear(&last, &w.wte, None)?.data().to_vec())
 }
 
-/// Greedy decoding: `n` times, append the highest-scoring next token. No KV cache (that's M4):
-/// every step recomputes the whole sequence, which is O(n^2) work but obviously correct.
+/// Greedy decoding: `n` times, append the highest-scoring next token. The reference has no KV
+/// cache (only the GPU model does, M4): every step recomputes the whole sequence, which is
+/// O(n^2) work but obviously correct.
 /// Stops early at the context length. Calls `on_token` after each token (for streaming output).
 pub fn generate_greedy(
     w: &Weights,

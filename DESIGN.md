@@ -18,9 +18,10 @@ CPU reference forward pass (plain Rust f32) ──┘  oracle: every kernel and 
                                                  differential-tested against it (D3, D5)
 ```
 
-Today (M1): the CPU reference GPT-2 end to end (safetensors loader, BPE tokenizer, forward
-pass, greedy generation, `ember generate`), matching a float64 numpy implementation. The
-GPU side is still M0's: a headless device, upload and readback, and one `add` kernel.
+Today (M4, Tier 1 done): GPT-2 124M runs end to end on the GPU with naive kernels and a KV
+cache, matching the CPU reference (itself checked against float64 numpy). Not yet built: the
+per-token command encoder and buffer reuse (M7; today every op submits its own dispatch and
+allocates its output), f16 / quantized weights (M9), and the sampler beyond greedy.
 
 ## Decisions
 

@@ -154,6 +154,15 @@ pub fn hidden_cached(
     if ids.is_empty() {
         return Err(Error::Input("empty token sequence".into()));
     }
+    // zip() below would silently stop at the shorter of the two: a cache built for a model with
+    // fewer layers would leave the later blocks attending over nothing.
+    if cache.layers.len() != w.blocks.len() {
+        return Err(Error::Shape(format!(
+            "KV cache has {} layers, the model {}",
+            cache.layers.len(),
+            w.blocks.len()
+        )));
+    }
     let start = cache.len;
     if start + ids.len() > w.config.n_ctx {
         return Err(Error::Input(format!(

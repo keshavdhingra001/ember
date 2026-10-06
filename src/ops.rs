@@ -344,8 +344,13 @@ pub fn attention_cached(
             start + t
         )));
     }
+    if n_head > gpu.limits.max_compute_workgroups_per_dimension as usize {
+        return Err(Error::Shape(format!(
+            "attention: {n_head} heads exceed one dispatch dimension"
+        )));
+    }
     let out = gpu.alloc(&[t, e]);
-    if t == 0 {
+    if t == 0 || e == 0 {
         return Ok(out);
     }
     let d = e / n_head;

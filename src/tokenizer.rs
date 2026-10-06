@@ -63,7 +63,8 @@ impl Tokenizer {
         let Value::Object(vocab) = vocab else {
             return Err("vocab.json is not an object".into());
         };
-        let mut tokens = vec![None; vocab.len()];
+        let n = vocab.len();
+        let mut tokens = vec![None; n];
         let mut ids = HashMap::with_capacity(vocab.len());
         for (text, id) in vocab {
             let id = id
@@ -71,7 +72,7 @@ impl Tokenizer {
                 .ok_or_else(|| format!("id of `{text}` is not an integer"))?;
             let slot = tokens
                 .get_mut(id as usize)
-                .ok_or_else(|| format!("id {id} of `{text}`: ids must be 0..{}", ids.len()))?;
+                .ok_or_else(|| format!("id {id} of `{text}`: ids must be 0..{n}"))?;
             let bytes = text
                 .chars()
                 .map(|c| char_to_byte.get(&c).copied())

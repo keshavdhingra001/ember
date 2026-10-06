@@ -153,6 +153,37 @@ fn cached_decode_is_bitwise_full_recompute() {
 }
 
 #[test]
+fn a_cache_for_another_model_is_rejected() {
+    // Same width and context, one layer fewer: every per-layer shape check passes, so only the
+    // layer count can tell. The cache must stay empty afterwards.
+    let g = gpu();
+    let gw = GpuWeights::upload(g, &tiny_random());
+    let one_layer = Config {
+        n_layer: 1,
+        ..gw.config.clone()
+    };
+    let mut cache = KvCache::new(g, &one_layer);
+    let e = gpt2_gpu::extend(g, &gw, &mut cache, &[1, 2]).unwrap_err();
+    assert!(e.to_string().contains("1 layers, the model 2"), "{e}");
+    assert!(cache.is_empty());
+    // Narrower rows or a shorter context are caught by the ops' own shape checks.
+    for config in [
+        Config {
+            n_embd: 6,
+            ..gw.config.clone()
+        },
+        Config {
+            n_ctx: 1,
+            ..gw.config.clone()
+        },
+    ] {
+        let mut cache = KvCache::new(g, &config);
+        assert!(gpt2_gpu::extend(g, &gw, &mut cache, &[1, 2]).is_err());
+        assert!(cache.is_empty());
+    }
+}
+
+#[test]
 fn gpt2_cached_decode_is_bitwise_full_recompute() {
     let Some(dir) = common::gpt2_golden_dir() else {
         return;

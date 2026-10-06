@@ -7,6 +7,9 @@ set -u
 export TMPDIR="$PWD/target/tmp"
 file="$1"
 cp "$file" "$TMPDIR/mutate.bak"
+# Put the original back however the script ends (Ctrl-C, a killed session): a planted bug left
+# in the tree would be committed by the next `git commit -a`.
+trap 'cp "$TMPDIR/mutate.bak" "$file"' EXIT
 while IFS= read -r expr; do
   [ -z "$expr" ] && continue
   sed -i "$expr" "$file"
@@ -21,4 +24,4 @@ while IFS= read -r expr; do
   fi
   cp "$TMPDIR/mutate.bak" "$file"
 done < "$2"
-cargo test -q 2>&1 | grep -E 'test result' | head -n 1
+timeout 300 cargo test -q 2>&1 | grep -E 'test result' | head -n 1

@@ -17,7 +17,8 @@ Next: M5, per-kernel GPU timings.
   the source of truth. Every GPU kernel is differential-tested against it with explicit tolerances.
 - **Deterministic.** Same device and inputs give bit-identical outputs: no float atomics, fixed
   reduction order, seeded sampling.
-- **Measured.** Performance claims come with GPU timestamp numbers and the method used.
+- **Measured.** Every performance claim states its method: wall clock today (median of 5 after a
+  warm-up), per-kernel GPU timestamps from M5.
 
 ## Try it
 ```bash

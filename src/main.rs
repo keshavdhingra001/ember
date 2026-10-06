@@ -23,8 +23,8 @@ fn main() -> ExitCode {
         None | Some("info") => info(),
         Some("selftest") => selftest(),
         Some("tokenize") if args.len() > 1 => tokenize(&args[1..].join(" ")),
-        Some("generate") if args.len() > 1 => generate(&args[1..]),
-        Some("bench") if args.len() > 1 => bench(&args[1..]),
+        Some("generate") => generate(&args[1..]),
+        Some("bench") => bench(&args[1..]),
         Some(other) => {
             eprintln!("unknown command or missing argument: `{other}`\n\n{USAGE}");
             return ExitCode::from(2);
@@ -109,17 +109,12 @@ fn tokenize(text: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Greedy GPT-2, streaming tokens as they come: on the GPU with a KV cache (D29), on the GPU
 /// recomputing everything with `--no-cache` (M3), or on the CPU reference with `--cpu`.
 fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = args;
-    let (mut cpu_ref, mut no_cache) = (false, false);
-    while let [flag, rest @ ..] = args {
-        match flag.as_str() {
-            "--cpu" => cpu_ref = true,
-            "--no-cache" => no_cache = true,
-            _ => break,
-        }
-        args = rest;
-    }
-    let (n, prompt) = parse_n(args, 20)?;
+    let Opts {
+        n,
+        cpu: cpu_ref,
+        no_cache,
+        prompt,
+    } = parse_opts(args, 20, &["--cpu", "--no-cache"])?;
     let dir = Path::new(GPT2_DIR);
     let tok = Tokenizer::load(dir)?;
     let w = Weights::load(dir)?;
@@ -163,38 +158,90 @@ fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `[-n N] <words...>` -> (N, the words joined by spaces).
-fn parse_n(args: &[String], default: usize) -> Result<(usize, String), Box<dyn std::error::Error>> {
-    Ok(match args {
-        [flag, n, rest @ ..] if flag == "-n" && !rest.is_empty() => (n.parse()?, rest.join(" ")),
-        _ => (default, args.join(" ")),
-    })
+/// Options before the prompt. `-n` and the flags a command allows come first, in any order;
+/// everything from the first other word on is the prompt.
+struct Opts {
+    n: usize,
+    cpu: bool,
+    no_cache: bool,
+    prompt: String,
+}
+
+fn parse_opts(
+    args: &[String],
+    default_n: usize,
+    flags: &[&str],
+) -> Result<Opts, Box<dyn std::error::Error>> {
+    let mut o = Opts {
+        n: default_n,
+        cpu: false,
+        no_cache: false,
+        prompt: String::new(),
+    };
+    let mut rest = args;
+    loop {
+        match rest {
+            [flag, v, tail @ ..] if flag == "-n" => {
+                o.n = v.parse().map_err(|_| format!("-n: `{v}` is not a count"))?;
+                rest = tail;
+            }
+            [flag] if flag == "-n" => return Err("-n needs a count".into()),
+            [flag, tail @ ..] if flags.contains(&flag.as_str()) => {
+                match flag.as_str() {
+                    "--cpu" => o.cpu = true,
+                    _ => o.no_cache = true,
+                }
+                rest = tail;
+            }
+            [flag, ..] if flag.starts_with("--") => {
+                return Err(format!("unknown flag `{flag}`\n\n{USAGE}").into());
+            }
+            _ => break,
+        }
+    }
+    o.prompt = rest.join(" ");
+    if o.prompt.is_empty() {
+        return Err(format!("missing prompt\n\n{USAGE}").into());
+    }
+    Ok(o)
 }
 
 /// `ember bench [-n N] <prompt>` (D35): prefill latency and decode rate with the KV cache, and
 /// the uncached rate for comparison. 1 warm-up run, then the median of 5, wall clock.
 fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     const RUNS: usize = 5;
-    let (n, prompt) = parse_n(args, 32)?;
+    let Opts { n, prompt, .. } = parse_opts(args, 32, &[])?;
     let dir = Path::new(GPT2_DIR);
     let tok = Tokenizer::load(dir)?;
     let w = Weights::load(dir)?;
     let ids = tok.encode(&prompt)?;
+    // The uncached run generates n + 1 tokens after the prompt. The greedy loop would quietly
+    // stop at the context length and the rates below would then divide by the wrong count.
+    if n == 0 || ids.len() + n + 1 > w.config.n_ctx {
+        return Err(format!(
+            "bench needs 1 <= n and prompt + n + 1 <= {} tokens (prompt is {}, n is {n})",
+            w.config.n_ctx,
+            ids.len()
+        )
+        .into());
+    }
     let gpu = Gpu::new()?;
     let gw = GpuWeights::upload(&gpu, &w);
     let mut cache = KvCache::new(&gpu, &w.config);
-    let argmax = |l: &[f32]| cpu::argmax(l).expect("logits contain NaN") as u32;
+    let argmax = |l: &[f32]| -> Result<u32, Box<dyn std::error::Error>> {
+        Ok(cpu::argmax(l).ok_or("logits contain NaN")? as u32)
+    };
 
     // One cached run: (prefill seconds, decode seconds for n tokens). The decode clock covers
     // everything a real step does: the model, the 201 KB readback and the argmax.
     let mut cached = || -> Result<(f64, f64), Box<dyn std::error::Error>> {
         cache.clear();
         let t0 = Instant::now();
-        let mut next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &ids)?);
+        let mut next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &ids)?)?;
         let prefill = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
         for _ in 0..n {
-            next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next])?);
+            next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next])?)?;
         }
         Ok((prefill, t1.elapsed().as_secs_f64()))
     };
@@ -257,7 +304,44 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::take_utf8;
+    use super::{parse_opts, take_utf8};
+
+    fn args(s: &str) -> Vec<String> {
+        s.split(' ')
+            .filter(|w| !w.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn options_come_before_the_prompt_in_any_order() {
+        let o = parse_opts(
+            &args("-n 5 --cpu hello world"),
+            20,
+            &["--cpu", "--no-cache"],
+        )
+        .unwrap();
+        assert_eq!((o.n, o.cpu, o.no_cache), (5, true, false));
+        assert_eq!(o.prompt, "hello world");
+        let o = parse_opts(&args("--no-cache -n 3 hi"), 20, &["--cpu", "--no-cache"]).unwrap();
+        assert_eq!(
+            (o.n, o.cpu, o.no_cache, o.prompt.as_str()),
+            (3, false, true, "hi")
+        );
+        // After the first prompt word, `-n` is text. A lone `-` word is text too.
+        let o = parse_opts(&args("say -n - twice"), 20, &[]).unwrap();
+        assert_eq!((o.n, o.prompt.as_str()), (20, "say -n - twice"));
+    }
+
+    #[test]
+    fn bad_options_are_errors_not_prompts() {
+        let flags = ["--cpu", "--no-cache"];
+        for bad in ["", "-n 5", "-n", "-n five hi", "--cpu", "--fast hi"] {
+            assert!(parse_opts(&args(bad), 20, &flags).is_err(), "`{bad}`");
+        }
+        // bench takes no flags: `--cpu` there is unknown.
+        assert!(parse_opts(&args("--cpu hi"), 32, &[]).is_err());
+    }
 
     #[test]
     fn take_utf8_holds_back_split_characters() {

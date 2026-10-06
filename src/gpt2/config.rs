@@ -52,6 +52,13 @@ impl Config {
                 .and_then(Value::as_f64)
                 .ok_or("`layer_norm_epsilon` must be a number")? as f32,
         };
+        // A negative or NaN eps makes sqrt(var + eps) NaN for a constant row; 0 makes it 0 / 0.
+        if !(c.ln_eps.is_finite() && c.ln_eps > 0.0) {
+            return Err(format!(
+                "layer_norm_epsilon {} must be positive and finite",
+                c.ln_eps
+            ));
+        }
         if !c.n_embd.is_multiple_of(c.n_head) {
             return Err(format!(
                 "n_embd {} is not divisible by n_head {}",
@@ -110,6 +117,8 @@ mod tests {
             (GPT2.replace("\"n_positions\": 1024,", ""), "`n_positions`"),
             (GPT2.replace("gelu_new", "relu"), "not supported"),
             (GPT2.replace("1e-05", "\"tiny\""), "layer_norm_epsilon"),
+            (GPT2.replace("1e-05", "-1e-05"), "positive and finite"),
+            (GPT2.replace("1e-05", "0.0"), "positive and finite"),
         ];
         for (json, want) in bad {
             let e = Config::from_json(&json).unwrap_err();
