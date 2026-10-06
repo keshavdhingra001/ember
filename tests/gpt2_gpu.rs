@@ -3,25 +3,11 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-
-use common::gpu;
+use common::{gpu, ids, json, tiny_dir};
 use ember::compare::{Tol, check};
 use ember::gpt2::gpu::{self as gpt2_gpu, GpuWeights, KvCache};
 use ember::gpt2::{self, Config, Weights};
 use serde_json::Value;
-
-fn ids(v: &Value) -> Vec<u32> {
-    v.as_array()
-        .unwrap()
-        .iter()
-        .map(|x| x.as_u64().unwrap() as u32)
-        .collect()
-}
-
-fn json(path: &Path) -> Value {
-    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
-}
 
 fn bits(x: &[f32]) -> Vec<u32> {
     x.iter().map(|v| v.to_bits()).collect()
@@ -38,10 +24,6 @@ const GPT2_TOL: Tol = Tol {
     abs: 1e-4,
     rel: 1e-5,
 };
-
-fn tiny_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_gpt2")
-}
 
 #[test]
 fn tiny_model_matches_cpu() {

@@ -8,6 +8,7 @@ pub mod gpu;
 pub mod ops;
 pub mod rng;
 pub mod safetensors;
+mod shape;
 pub mod tensor;
 pub mod tokenizer;
 

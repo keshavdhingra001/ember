@@ -59,14 +59,25 @@ impl Gpu {
             .map_err(|e| Error::Device(e.to_string()))?;
         let limits = device.limits();
         let k = |name, src| compute_pipeline(&device, name, src);
+        // The row kernels share reduce.wgsl's trees: same source text, prepended.
+        let with_reduce = |src: &str| [include_str!("shaders/reduce.wgsl"), src].concat();
         let kernels = Kernels {
             add: k("add", include_str!("shaders/add.wgsl")),
             gelu: k("gelu", include_str!("shaders/gelu.wgsl")),
             embed: k("embed", include_str!("shaders/embed.wgsl")),
-            softmax: k("softmax", include_str!("shaders/softmax.wgsl")),
-            layer_norm: k("layer_norm", include_str!("shaders/layer_norm.wgsl")),
+            softmax: k(
+                "softmax",
+                &with_reduce(include_str!("shaders/softmax.wgsl")),
+            ),
+            layer_norm: k(
+                "layer_norm",
+                &with_reduce(include_str!("shaders/layer_norm.wgsl")),
+            ),
             linear: k("linear", include_str!("shaders/linear.wgsl")),
-            attention: k("attention", include_str!("shaders/attention.wgsl")),
+            attention: k(
+                "attention",
+                &with_reduce(include_str!("shaders/attention.wgsl")),
+            ),
             kv_write: k("kv_write", include_str!("shaders/kv_write.wgsl")),
         };
         Ok(Gpu {

@@ -1,6 +1,6 @@
 // LayerNorm of each row of x: [rows, cols] (see cpu::layer_norm). One workgroup per row, two
 // sum reductions (mean, then the mean of squared deviations: two passes, as on the CPU), each
-// a serial fold per thread followed by a fixed tree in shared memory (D18).
+// a serial fold per thread followed by the fixed tree in reduce.wgsl (D18).
 
 struct Params {
     cols: u32,
@@ -17,23 +17,6 @@ struct Params {
 
 const WG: u32 = 256u;
 
-var<workgroup> partial: array<f32, WG>;
-
-// Sum of every thread's `v`, returned to all threads. Must be called from uniform control flow.
-fn workgroup_sum(l: u32, v: f32) -> f32 {
-    partial[l] = v;
-    workgroupBarrier();
-    for (var s = WG / 2u; s > 0u; s >>= 1u) {
-        if (l < s) {
-            partial[l] += partial[l + s];
-        }
-        workgroupBarrier();
-    }
-    let total = partial[0];
-    workgroupBarrier();  // all reads of partial[0] happen before the next call overwrites it
-    return total;
-}
-
 @compute @workgroup_size(WG)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -47,14 +30,14 @@ fn main(
     for (var i = l; i < n; i += WG) {
         s += x[base + i];
     }
-    let mean = workgroup_sum(l, s) / f32(n);
+    let mean = tree_sum(l, s) / f32(n);
 
     var sq = 0.0;
     for (var i = l; i < n; i += WG) {
         let d = x[base + i] - mean;
         sq += d * d;
     }
-    let var_ = workgroup_sum(l, sq) / f32(n);
+    let var_ = tree_sum(l, sq) / f32(n);
     let inv_std = 1.0 / sqrt(var_ + params.eps);
 
     for (var i = l; i < n; i += WG) {

@@ -7,7 +7,7 @@
 // Naive (D20): one workgroup per (query row i, head h).
 // 1. Score keys j = 0..=pos: thread l takes j = l, l + 64, ...; each score is a serial dot
 //    product of length d. Scores live in shared memory (at most MAX_CTX of them).
-// 2. Softmax over those scores: max and sum by the fixed tree (D18), then normalize.
+// 2. Softmax over those scores: max and sum by the fixed tree (reduce.wgsl), then normalize.
 // 3. Thread l produces output dims c = l, l + 64, ... as a serial weighted sum of v_j over j.
 // Keys after pos are never scored, so the causal mask costs nothing.
 
@@ -33,35 +33,6 @@ const MAX_CTX: u32 = 1024u;  // must match ops::ATTENTION_MAX_CTX
 const LOWEST: f32 = -3.40282347e38;
 
 var<workgroup> scores: array<f32, MAX_CTX>;
-var<workgroup> partial: array<f32, WG>;
-
-fn tree_max(l: u32, v: f32) -> f32 {
-    partial[l] = v;
-    workgroupBarrier();
-    for (var s = WG / 2u; s > 0u; s >>= 1u) {
-        if (l < s) {
-            partial[l] = max(partial[l], partial[l + s]);
-        }
-        workgroupBarrier();
-    }
-    let r = partial[0];
-    workgroupBarrier();  // everyone has read partial[0] before the next tree overwrites it
-    return r;
-}
-
-fn tree_sum(l: u32, v: f32) -> f32 {
-    partial[l] = v;
-    workgroupBarrier();
-    for (var s = WG / 2u; s > 0u; s >>= 1u) {
-        if (l < s) {
-            partial[l] += partial[l + s];
-        }
-        workgroupBarrier();
-    }
-    let r = partial[0];
-    workgroupBarrier();
-    return r;
-}
 
 @compute @workgroup_size(WG)
 fn main(

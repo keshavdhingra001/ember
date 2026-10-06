@@ -25,7 +25,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
 
 ## Decisions
 
-### D1: Stack: Rust + wgpu + WGSL (owner chose 2026-10-04)
+### D1: Stack: Rust + wgpu + WGSL
 - **Alternatives:** TypeScript on the browser WebGPU API; C++ on Dawn (Chrome's WebGPU).
 - **Why:** wgpu is the WebGPU implementation Firefox uses. It runs natively on Vulkan / Metal / DX12
   and compiles to wasm, so the same kernels run on the laptop and in a browser (M10). GPU code is
@@ -34,14 +34,14 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   subgroup ops, no float atomics), and that is the interesting constraint to talk about.
 - **Hardware:** Intel Iris Xe (TigerLake GT2, integrated, shares system RAM) via Mesa's Vulkan driver.
 
-### D2: Model path: GPT-2 124M, then a small Llama-family model (owner chose 2026-10-04)
-- **Alternatives:** the owner's FaceRestore U-Net (convolutions); jumping straight to Llama.
+### D2: Model path: GPT-2 124M, then a small Llama-family model
+- **Alternatives:** a FaceRestore U-Net (convolutions); jumping straight to Llama.
 - **Why:** GPT-2 is the simplest real transformer (learned positions, LayerNorm, GELU, MHA), with
   public weights and well-known outputs, so the first milestones are about correctness, not
   architecture. The Llama family (M8) then adds what interviews ask about now: RoPE, RMSNorm,
   SwiGLU, grouped-query attention, and quantized weights (M9). The U-Net is a Tier 3 stretch.
 
-### D3: The CPU reference is the oracle (Claude, M0; owner confirmed 2026-10-05)
+### D3: The CPU reference is the oracle
 - **What:** a plain, obviously correct Rust implementation of every op (and in M1 of the whole
   GPT-2 forward pass). Every GPU kernel is differential-tested against it on edge-case and random
   shapes. The reference is checked once against pinned outputs of the original model.
@@ -49,7 +49,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
 - **Why:** goldens only cover the inputs they were dumped for; an oracle covers any shape and any
   input, and points to the exact kernel that broke. Same idea as lob's reference book.
 
-### D4: Determinism (Claude, M0; owner confirmed 2026-10-05)
+### D4: Determinism
 - **What:** same device + same inputs gives bit-identical outputs. Kernels never use atomics on
   floats, reductions have a fixed order (fixed workgroup size, fixed tree), sampling takes a seed,
   and engine code never reads a clock (only the measurement module does).
@@ -57,7 +57,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   gives different bits run to run. Then a test failure can't be reproduced, and "did my change
   alter the output?" has no answer. Bit-identical across *different* GPUs is not promised (D5).
 
-### D5: Compare floats with explicit tolerances (Claude, M0; owner confirmed 2026-10-05)
+### D5: Compare floats with explicit tolerances
 - **What:** `compare::check(got, want, Tol { abs, rel })` passes when every element satisfies
   `|got - want| <= abs + rel * |want|`, and NaN or infinity mismatches always fail. On failure it
   reports the worst index, both values and the error.
@@ -67,7 +67,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   kernels; a mean would hide one broken element. Tolerances are set per op (exact ops such as `add`
   use 0) and any loosening gets a note here.
 
-### D6: Device setup (Claude, M0; owner confirmed 2026-10-05)
+### D6: Device setup
 - **What:** one headless device (no window surface), high-performance adapter preference,
   requesting the adapter's own limits instead of WebGPU defaults. Blocking API on native via
   `pollster`; the async core stays reachable for wasm later (M10).
@@ -75,14 +75,14 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   embedding is 50257 × 768 × 4 B = 147 MiB. Asking for what the adapter supports avoids splitting
   that tensor. `ember info` prints the limits we got.
 
-### D7: Tensor layout (Claude, M0; owner confirmed 2026-10-05)
+### D7: Tensor layout
 - **What:** contiguous row-major `f32`, shape kept on the host (`Vec<usize>`). A `GpuTensor` is a
   storage buffer plus its shape. No strides or views yet.
 - **Why:** every kernel indexes `row * cols + col` and nothing else, which keeps the WGSL readable.
   Transposes happen once at load time instead of through strided reads. f16 and quantized layouts
   arrive with their milestones (M7, M9).
 
-### D8: Elementwise dispatch with a grid-stride loop (Claude, M0; owner confirmed 2026-10-05)
+### D8: Elementwise dispatch with a grid-stride loop
 - **What:** workgroup size 256; dispatch `min(ceil(n / 256), 65535)` workgroups; each invocation
   loops `i += 256 * num_workgroups`.
 - **Alternatives:** one invocation per element with a 2D dispatch for large `n`.
@@ -90,7 +90,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   16.7M elements, and GPT-2's embedding has 38.6M. The loop handles any `n` with a 1D dispatch.
   256 is a multiple of every vendor's SIMD width (Intel 8/16/32, AMD 32/64, NVIDIA 32).
 
-### D9: Out-of-bounds accesses are contained, not trusted (Claude, M0; owner confirmed 2026-10-05)
+### D9: Out-of-bounds accesses are contained, not trusted
 - **What:** WebGPU guarantees that a shader can't read or write outside a bound buffer: wgpu adds
   bounds checks (or relies on Vulkan's robust buffer access), so an out-of-bounds write is dropped
   or clamped to the end of the buffer. Kernels still bounds-check by `params.n`, never by buffer size.
@@ -100,14 +100,14 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   than `n` floats, the same bug would silently corrupt the neighbour. M7's tests must use
   oversized buffers with sentinel values to catch it.
 
-### D10: GPT-2 weights: safetensors, hand-parsed over mmap (owner approved 2026-10-05, M1)
+### D10: GPT-2 weights: safetensors, hand-parsed over mmap
 - **What:** `openai-community/gpt2` `model.safetensors` (548 MB) plus `config.json`, `vocab.json`
   and `merges.txt` in `data/gpt2/` (git-ignored). A small hand-written parser reads the format
   (u64 little-endian header length, a JSON header mapping names to dtype, shape and byte offsets,
   then raw tensor bytes) over a `memmap2` mapping.
 - **Alternatives:** the `safetensors` crate; converting to a custom format.
-- **Why:** the format is simple enough to parse in about a page, and owning the parser means the
-  owner can explain exactly how bytes become tensors. mmap avoids copying 548 MB before it is needed.
+- **Why:** the format is simple enough to parse in about a page, and owning the parser means every
+  step from bytes to tensors is explainable. mmap avoids copying 548 MB before it is needed.
 - **Details:** the JSON header itself is parsed with `serde_json` (JSON parsing is not the point).
   The reader validates everything the header claims before trusting it: header length within the
   file and under the format's 100 MB cap, known dtypes, `shape × dtype size == end - begin` with
@@ -118,7 +118,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   `scripts/fetch_gpt2.sh` pins the checkpoint's sha256
   (`248dfc39…d3a707`, same as Hugging Face's LFS hash).
 
-### D11: Tokenizer: hand-written byte-level BPE (owner approved 2026-10-05, M1)
+### D11: Tokenizer: hand-written byte-level BPE
 - **What:** GPT-2's algorithm from `vocab.json` + `merges.txt`: the bytes-to-unicode map, the regex
   pre-split, then repeatedly merging the lowest-rank adjacent pair.
 - **Alternatives:** Hugging Face's `tokenizers` crate.
@@ -133,7 +133,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   `\x85`, combining marks, CJK, emoji ZWJ sequences, and the empty string
   (`tests/fixtures/gpt2_tokenizer_cases.json`).
 
-### D12: Pinned reference outputs from a numpy-only script (owner approved 2026-10-05, M1)
+### D12: Pinned reference outputs from a numpy-only script
 - **What:** a one-off Python script that uses only `numpy` (no torch, since PyPI is slow on this
   network) writes token ids and logits for 3 prompts to `data/gpt2/golden/`. The Rust reference
   must match the logits to 1e-4.
@@ -143,8 +143,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   stores float32. It is written vectorized (whole-sequence matmuls, all heads at once,
   `-inf` masking) so it shares little structure with the Rust loops. Two extra checks keep it
   from being "the same author's bug twice". Token ids come from Hugging Face `tokenizers`
-  (installed in the venv next to numpy, a deviation from "numpy only" that the owner
-  confirmed on 2026-10-05). And its greedy output
+  (installed in the venv next to numpy, a deliberate deviation from "numpy only"). And its greedy output
   must reproduce the continuation Hugging Face published for "I enjoy walking with my cute dog";
   the script refuses to write goldens otherwise.
 - **Measured (2026-10-05):** GPT-2 124M logits on 3 prompts (6, 10 and 21 tokens): worst
@@ -155,7 +154,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   continuations match token for token; the smallest top-2 logit gap in them is 0.028, far above
   the error. Tiny model: worst absolute error 1.2e-6 at tolerance 1e-5.
 
-### D13: Reference matmul is a naive triple loop (owner approved 2026-10-05, M1)
+### D13: Reference matmul is a naive triple loop
 - **What:** row-major f32, weights transposed once at load (D7), no BLAS.
 - **Alternatives:** `ndarray` or BLAS.
 - **Why:** the oracle has to be obviously correct, and it's allowed to be slow.
@@ -164,19 +163,19 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   dependency chain, which can't vectorize without reordering the sum (changing the bits). Unoptimized
   it is about 30× slower, so `[profile.test]` uses `opt-level = 3`. The GPT-2 greedy test
   (52 steps, ~100 s) is `#[ignore]`d and runs with `cargo test -- --ignored`.
-- **Threaded (owner approved 2026-10-05):** `linear` splits big products (≥ 2^20 multiply-adds)
+- **Threaded:** `linear` splits big products (≥ 2^20 multiply-adds)
   across `available_parallelism()` threads, in contiguous chunks of the output. Each element is
   still one serial sum, so results are bitwise identical to the serial loop (a test compares
   them bit for bit) and independent of the thread count. Measured the same way: 3.29 tokens/s
   on 8 threads (5.5×). The GPT-2 greedy test is back in the default run (~24 s).
 
-### D14: Model shape comes from config.json (owner approved 2026-10-05, M1)
+### D14: Model shape comes from config.json
 - **What:** `n_layer`, `n_head`, `n_embd`, `n_ctx` and `vocab_size` are read into a config struct.
   No sizes are hard-coded.
 - **Why:** hard-coded constants would break for gpt2-medium/large, and they hide shape bugs that
   the tiny test models (D15) would otherwise catch.
 
-### D15: Tests run without the weights (owner approved 2026-10-05, M1)
+### D15: Tests run without the weights
 - **What:** two tiny models with odd sizes, both 2 layers, 3 heads, E = 12, vocab 37, context 16.
   `Weights::random` (seeded) feeds property tests: prefix rows are bitwise equal, token order
   matters, `next_logits` equals the last row. A committed fixture
@@ -188,7 +187,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
 - **Why:** CI and fresh clones shouldn't need a 548 MB download, and tiny models with odd sizes catch
   indexing bugs that 768-wide tensors make hard to debug.
 
-### D16: Greedy decoding semantics (Claude, M1; owner confirmed 2026-10-05)
+### D16: Greedy decoding semantics
 - **What:** `argmax` returns the first index among equal maxima, and `None` if any logit is NaN
   (generation then fails with an error). Generation stops early at the context length.
   `<|endoftext|>` doesn't stop it: the caller asks for `n` tokens and gets `n`.
@@ -196,7 +195,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   with everything, so a plain max loop starting on a NaN returns index 0 forever. A broken
   model would then look like a model that likes token 0 (a test caught exactly that).
 
-## M2: GPU kernels (owner approved the table 2026-10-05)
+## M2: GPU kernels
 
 ### D17: Kernel order, simplest first
 - **What:** `gelu` (elementwise) → residual `add` (M0's kernel) → `embed` (gather) →
@@ -280,7 +279,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   the value subtracted, so a slightly wrong max only shows when `exp` overflows. Tests with one
   dominant logit (100 among ±5, positioned so each mutant misses it) now catch all four.
 
-### D23: The CPU LayerNorm computes in f64 (owner approved 2026-10-05)
+### D23: The CPU LayerNorm computes in f64
 - **What:** mean, variance and every output of `cpu::layer_norm` are computed in f64 and
   rounded to f32 once.
 - **Alternatives:** pairwise f32 summation; leaving the tolerance at 1e-4.
@@ -290,7 +289,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   improved slightly: worst relative error 1.0e-5 → 9.5e-6. The other reductions (softmax, attention)
   have small enough errors that they stay f32.
 
-## M3: GPT-2 on the GPU (owner approved the table 2026-10-05)
+## M3: GPT-2 on the GPU
 
 ### D24: Weights are uploaded once
 - **What:** `GpuWeights::upload(&Weights)` mirrors `Weights` with a `GpuTensor` per tensor,
@@ -344,7 +343,7 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   (D19, D20), ~160 queue submits per step (D25), and a per-step readback. M4 (KV cache) and M5
   (per-kernel timings) are where real numbers start.
 
-## M4: KV cache and incremental decode (owner approved the table 2026-10-05)
+## M4: KV cache and incremental decode
 
 ### D30: KV cache layout
 - **What:** per layer, a K buffer and a V buffer of `[n_ctx, E]`: row = absolute position, heads

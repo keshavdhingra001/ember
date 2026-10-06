@@ -82,28 +82,48 @@ pub fn hidden(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<GpuTensor> {
     if ids.is_empty() {
         return Err(Error::Input("empty token sequence".into()));
     }
-    let eps = w.config.ln_eps;
     let mut x = ops::embed(gpu, &w.wte, &w.wpe, ids, 0)?;
     for b in &w.blocks {
-        let h = ops::layer_norm(gpu, &x, &b.ln_1.gain, &b.ln_1.bias, eps)?;
-        let qkv = ops::linear(gpu, &h, &b.qkv.w, Some(&b.qkv.b))?;
-        let a = ops::causal_attention(gpu, &qkv, w.config.n_head)?;
-        let a = ops::linear(gpu, &a, &b.attn_out.w, Some(&b.attn_out.b))?;
-        x = ops::add(gpu, &x, &a)?;
-
-        let h = ops::layer_norm(gpu, &x, &b.ln_2.gain, &b.ln_2.bias, eps)?;
-        let m = ops::gelu(gpu, &ops::linear(gpu, &h, &b.fc.w, Some(&b.fc.b))?)?;
-        let m = ops::linear(gpu, &m, &b.fc_out.w, Some(&b.fc_out.b))?;
-        x = ops::add(gpu, &x, &m)?;
+        x = block(gpu, w, b, &x, |qkv| {
+            ops::causal_attention(gpu, qkv, w.config.n_head)
+        })?;
     }
-    ops::layer_norm(gpu, &x, &w.ln_f.gain, &w.ln_f.bias, eps)
+    ops::layer_norm(gpu, &x, &w.ln_f.gain, &w.ln_f.bias, w.config.ln_eps)
+}
+
+/// One transformer block, `x + attn(ln_1(x))` then `+ mlp(ln_2(x))`. `attend` maps the block's
+/// `qkv: [T, 3E]` to the heads' outputs `[T, E]`: full causal attention, or attention through a
+/// KV cache. Everything else is the same op sequence for both paths, which D33's bitwise test
+/// relies on.
+fn block(
+    gpu: &Gpu,
+    w: &GpuWeights,
+    b: &GpuBlock,
+    x: &GpuTensor,
+    attend: impl FnOnce(&GpuTensor) -> Result<GpuTensor>,
+) -> Result<GpuTensor> {
+    let eps = w.config.ln_eps;
+    let h = ops::layer_norm(gpu, x, &b.ln_1.gain, &b.ln_1.bias, eps)?;
+    let qkv = ops::linear(gpu, &h, &b.qkv.w, Some(&b.qkv.b))?;
+    let a = attend(&qkv)?;
+    let a = ops::linear(gpu, &a, &b.attn_out.w, Some(&b.attn_out.b))?;
+    let x = ops::add(gpu, x, &a)?;
+
+    let h = ops::layer_norm(gpu, &x, &b.ln_2.gain, &b.ln_2.bias, eps)?;
+    let m = ops::gelu(gpu, &ops::linear(gpu, &h, &b.fc.w, Some(&b.fc.b))?)?;
+    let m = ops::linear(gpu, &m, &b.fc_out.w, Some(&b.fc_out.b))?;
+    ops::add(gpu, &x, &m)
 }
 
 /// Next-token logits `[V]`, read back to the host (D28). The LM head runs on the last row only
 /// (D26).
 pub fn next_logits(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<Vec<f32>> {
-    let h = hidden(gpu, w, ids)?;
-    let last = ops::row(gpu, &h, ids.len() - 1)?;
+    last_logits(gpu, w, &hidden(gpu, w, ids)?)
+}
+
+/// The tied LM head on the last row of `h: [T, E]`, read back.
+fn last_logits(gpu: &Gpu, w: &GpuWeights, h: &GpuTensor) -> Result<Vec<f32>> {
+    let last = ops::row(gpu, h, h.shape()[0] - 1)?;
     let logits = ops::linear(gpu, &last, &w.wte, None)?;
     Ok(gpu.read(&logits)?.data().to_vec())
 }
@@ -171,33 +191,22 @@ pub fn hidden_cached(
             w.config.n_ctx
         )));
     }
-    let eps = w.config.ln_eps;
     let mut x = ops::embed(gpu, &w.wte, &w.wpe, ids, start)?;
     for (b, (k, v)) in w.blocks.iter().zip(&cache.layers) {
-        let h = ops::layer_norm(gpu, &x, &b.ln_1.gain, &b.ln_1.bias, eps)?;
-        let qkv = ops::linear(gpu, &h, &b.qkv.w, Some(&b.qkv.b))?;
-        ops::kv_write(gpu, &qkv, k, v, start)?;
-        let a = ops::attention_cached(gpu, &qkv, k, v, start, w.config.n_head)?;
-        let a = ops::linear(gpu, &a, &b.attn_out.w, Some(&b.attn_out.b))?;
-        x = ops::add(gpu, &x, &a)?;
-
-        let h = ops::layer_norm(gpu, &x, &b.ln_2.gain, &b.ln_2.bias, eps)?;
-        let m = ops::gelu(gpu, &ops::linear(gpu, &h, &b.fc.w, Some(&b.fc.b))?)?;
-        let m = ops::linear(gpu, &m, &b.fc_out.w, Some(&b.fc_out.b))?;
-        x = ops::add(gpu, &x, &m)?;
+        x = block(gpu, w, b, &x, |qkv| {
+            ops::kv_write(gpu, qkv, k, v, start)?;
+            ops::attention_cached(gpu, qkv, k, v, start, w.config.n_head)
+        })?;
     }
     // Only now: if an op above failed, the cache still describes the old sequence.
     cache.len += ids.len();
-    ops::layer_norm(gpu, &x, &w.ln_f.gain, &w.ln_f.bias, eps)
+    ops::layer_norm(gpu, &x, &w.ln_f.gain, &w.ln_f.bias, w.config.ln_eps)
 }
 
 /// `hidden_cached`, then the LM head on the last row (D26): the next-token logits after `ids`,
 /// read back (D28).
 pub fn extend(gpu: &Gpu, w: &GpuWeights, cache: &mut KvCache, ids: &[u32]) -> Result<Vec<f32>> {
-    let h = hidden_cached(gpu, w, cache, ids)?;
-    let last = ops::row(gpu, &h, ids.len() - 1)?;
-    let logits = ops::linear(gpu, &last, &w.wte, None)?;
-    Ok(gpu.read(&logits)?.data().to_vec())
+    last_logits(gpu, w, &hidden_cached(gpu, w, cache, ids)?)
 }
 
 /// Greedy decoding with a KV cache: one prefill call for the prompt, then one single-token call

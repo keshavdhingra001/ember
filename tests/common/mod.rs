@@ -2,10 +2,11 @@
 //! tens of milliseconds and the tests run in parallel threads (wgpu devices are Sync).
 #![allow(dead_code)] // each test binary uses a different subset
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ember::Gpu;
+use serde_json::Value;
 
 pub fn gpu() -> &'static Gpu {
     static GPU: OnceLock<Gpu> = OnceLock::new();
@@ -42,4 +43,22 @@ pub fn gpt2_golden_dir() -> Option<PathBuf> {
         );
         None
     }
+}
+
+/// The committed 2-layer model, its tokenizer files and its numpy goldens.
+pub fn tiny_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_gpt2")
+}
+
+pub fn json(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// A JSON array of token ids.
+pub fn ids(v: &Value) -> Vec<u32> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_u64().unwrap() as u32)
+        .collect()
 }

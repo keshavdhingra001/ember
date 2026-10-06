@@ -115,10 +115,7 @@ fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         no_cache,
         prompt,
     } = parse_opts(args, 20, &["--cpu", "--no-cache"])?;
-    let dir = Path::new(GPT2_DIR);
-    let tok = Tokenizer::load(dir)?;
-    let w = Weights::load(dir)?;
-    let ids = tok.encode(&prompt)?;
+    let (tok, w, ids) = load_gpt2(&prompt)?;
 
     let mut pending = Vec::new();
     let on_token = |id: u32| {
@@ -156,6 +153,15 @@ fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         out.len() as f64 / secs
     );
     Ok(())
+}
+
+/// The tokenizer and weights from `data/gpt2/`, and the prompt's token ids.
+fn load_gpt2(prompt: &str) -> Result<(Tokenizer, Weights, Vec<u32>), Box<dyn std::error::Error>> {
+    let dir = Path::new(GPT2_DIR);
+    let tok = Tokenizer::load(dir)?;
+    let w = Weights::load(dir)?;
+    let ids = tok.encode(prompt)?;
+    Ok((tok, w, ids))
 }
 
 /// Options before the prompt. `-n` and the flags a command allows come first, in any order;
@@ -211,10 +217,7 @@ fn parse_opts(
 fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     const RUNS: usize = 5;
     let Opts { n, prompt, .. } = parse_opts(args, 32, &[])?;
-    let dir = Path::new(GPT2_DIR);
-    let tok = Tokenizer::load(dir)?;
-    let w = Weights::load(dir)?;
-    let ids = tok.encode(&prompt)?;
+    let (_, w, ids) = load_gpt2(&prompt)?;
     // The uncached run generates n + 1 tokens after the prompt. The greedy loop would quietly
     // stop at the context length and the rates below would then divide by the wrong count.
     if n == 0 || ids.len() + n + 1 > w.config.n_ctx {

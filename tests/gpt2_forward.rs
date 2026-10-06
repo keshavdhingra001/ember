@@ -4,7 +4,9 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use common::{ids, json, tiny_dir};
+
+use std::path::Path;
 
 use ember::compare::{self, Tol};
 use ember::gpt2::{self, Weights};
@@ -18,18 +20,6 @@ fn read_f32(path: &Path) -> Vec<f32> {
         .iter()
         .map(|b| f32::from_le_bytes(*b))
         .collect()
-}
-
-fn ids(v: &Value) -> Vec<u32> {
-    v.as_array()
-        .unwrap()
-        .iter()
-        .map(|x| x.as_u64().unwrap() as u32)
-        .collect()
-}
-
-fn json(path: &Path) -> Value {
-    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
 /// Logits tolerance for the tiny model (2 layers, E = 12, values O(1)).
@@ -48,7 +38,7 @@ const GPT2_TOL: Tol = Tol {
 
 #[test]
 fn tiny_model_matches_numpy() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_gpt2");
+    let dir = tiny_dir();
     let w = Weights::load(&dir).unwrap();
     let golden = json(&dir.join("golden.json"));
 

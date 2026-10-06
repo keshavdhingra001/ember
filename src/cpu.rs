@@ -2,11 +2,12 @@
 //! is differential-tested against (D3). Clarity beats speed here, always.
 
 use crate::error::{Error, Result};
+use crate::shape;
 use crate::tensor::Tensor;
 
 /// Elementwise `a + b`. Shapes must match exactly (no broadcasting yet).
 pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    same_shape_dims("add", a.shape(), b.shape())?;
+    shape::same("add", a.shape(), b.shape())?;
     let data = a.data().iter().zip(b.data()).map(|(x, y)| x + y).collect();
     Tensor::new(a.shape(), data)
 }
@@ -18,21 +19,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// computes an element, never how: every element is still the same serial sum, so the bits
 /// are identical to the single-threaded loop (D4) regardless of the thread count.
 pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
-    let (&[t, n_in], &[n_out, w_in]) = (x.shape(), w.shape()) else {
-        return Err(Error::Shape(format!(
-            "linear: x {:?} and w {:?} must be 2-D",
-            x.shape(),
-            w.shape()
-        )));
-    };
-    if n_in != w_in || b.is_some_and(|b| b.shape() != [n_out]) {
-        return Err(Error::Shape(format!(
-            "linear: x {:?}, w {:?}, b {:?}",
-            x.shape(),
-            w.shape(),
-            b.map(Tensor::shape)
-        )));
-    }
+    let (t, n_in, n_out) = shape::linear(x.shape(), w.shape(), b.map(Tensor::shape))?;
     let (x, w, b) = (x.data(), w.data(), b.map(Tensor::data));
     // Output element `idx` is row i = idx / n_out, feature o = idx % n_out.
     let element = |idx: usize| {
@@ -78,20 +65,7 @@ pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
 /// in f32 this oracle was less accurate than the GPU's tree sum (D22). The oracle should be the
 /// most accurate thing in the room.
 pub fn layer_norm(x: &Tensor, gain: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
-    let &[t, e] = x.shape() else {
-        return Err(Error::Shape(format!(
-            "layer_norm: x {:?} must be 2-D",
-            x.shape()
-        )));
-    };
-    if gain.shape() != [e] || bias.shape() != [e] {
-        return Err(Error::Shape(format!(
-            "layer_norm: x {:?}, gain {:?}, bias {:?}",
-            x.shape(),
-            gain.shape(),
-            bias.shape()
-        )));
-    }
+    let (t, e) = shape::layer_norm(x.shape(), gain.shape(), bias.shape())?;
     let (g, b) = (gain.data(), bias.data());
     let mut out = Vec::with_capacity(t * e);
     for row in x.data().chunks_exact(e) {
@@ -163,19 +137,8 @@ pub fn softmax_rows(x: &Tensor) -> Result<Tensor> {
 /// softmax the scores, and average the `v_j` with those weights. Positions after t are not
 /// masked with -inf: they are never scored at all, which is the same thing.
 pub fn causal_attention(qkv: &Tensor, n_head: usize) -> Result<Tensor> {
-    let &[t, three_e] = qkv.shape() else {
-        return Err(Error::Shape(format!(
-            "attention: qkv {:?} must be 2-D",
-            qkv.shape()
-        )));
-    };
-    if n_head == 0 || three_e % (3 * n_head) != 0 {
-        return Err(Error::Shape(format!(
-            "attention: qkv {:?} doesn't split into 3 x {n_head} heads",
-            qkv.shape()
-        )));
-    }
-    let e = three_e / 3;
+    let (t, e) = shape::qkv("attention", qkv.shape(), n_head)?;
+    let three_e = 3 * e;
     let d = e / n_head;
     let scale = 1.0 / (d as f32).sqrt();
     let x = qkv.data();
@@ -211,33 +174,9 @@ pub fn causal_attention(qkv: &Tensor, n_head: usize) -> Result<Tensor> {
 /// Input embedding: row t is `wte[ids[t]] + wpe[t]` (token embedding plus learned position
 /// embedding). `wte: [V, E]`, `wpe: [n_ctx, E]`.
 pub fn embed(wte: &Tensor, wpe: &Tensor, ids: &[u32]) -> Result<Tensor> {
-    let (&[v, e], &[n_ctx, e2]) = (wte.shape(), wpe.shape()) else {
-        return Err(Error::Shape(format!(
-            "embed: wte {:?} and wpe {:?} must be 2-D",
-            wte.shape(),
-            wpe.shape()
-        )));
-    };
-    if e != e2 {
-        return Err(Error::Shape(format!(
-            "embed: wte {:?} vs wpe {:?}",
-            wte.shape(),
-            wpe.shape()
-        )));
-    }
-    if ids.len() > n_ctx {
-        return Err(Error::Input(format!(
-            "{} tokens exceed the context length {n_ctx}",
-            ids.len()
-        )));
-    }
+    let e = shape::embed(wte.shape(), wpe.shape(), ids, 0)?;
     let mut out = Vec::with_capacity(ids.len() * e);
     for (pos, &id) in ids.iter().enumerate() {
-        if id as usize >= v {
-            return Err(Error::Input(format!(
-                "token id {id} is outside the vocab (size {v})"
-            )));
-        }
         let tok = &wte.data()[id as usize * e..][..e];
         let p = &wpe.data()[pos * e..][..e];
         out.extend(tok.iter().zip(p).map(|(a, b)| a + b));
@@ -277,13 +216,6 @@ pub fn transpose(a: &Tensor) -> Result<Tensor> {
         }
     }
     Tensor::new(&[c, r], out)
-}
-
-pub(crate) fn same_shape_dims(op: &str, a: &[usize], b: &[usize]) -> Result<()> {
-    if a != b {
-        return Err(Error::Shape(format!("{op}: {a:?} vs {b:?}")));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

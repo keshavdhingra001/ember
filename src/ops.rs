@@ -1,9 +1,9 @@
 //! GPU ops: host-side wrappers that check shapes, allocate the output and dispatch a kernel.
 //! Each one has a CPU twin in `cpu.rs` that it is tested against.
 
-use crate::cpu::same_shape_dims;
 use crate::error::{Error, Result};
 use crate::gpu::Gpu;
+use crate::shape;
 use crate::tensor::GpuTensor;
 
 /// Longest sequence the attention kernel takes: its scores live in a shared-memory array of
@@ -12,13 +12,6 @@ pub const ATTENTION_MAX_CTX: usize = 1024;
 
 /// Threads per workgroup for 1-D elementwise kernels. Must match `WG` in the shaders.
 pub const ELEMENTWISE_WG: u32 = 256;
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct LenParams {
-    n: u32,
-    _pad: [u32; 3],
-}
 
 /// Elementwise `a + b` on the GPU.
 pub fn add(gpu: &Gpu, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor> {
@@ -33,18 +26,19 @@ pub fn add_with_max_groups(
     b: &GpuTensor,
     max_groups: u32,
 ) -> Result<GpuTensor> {
-    same_shape_dims("add", a.shape(), b.shape())?;
+    shape::same("add", a.shape(), b.shape())?;
     let out = gpu.alloc(a.shape());
     let n = a.len();
     if n == 0 {
         return Ok(out);
     }
-    let n = len_u32(n)?;
-    let params = gpu.uniform(&LenParams { n, _pad: [0; 3] });
-    gpu.dispatch(
+    let params = Params4::new(len_u32(n)?, 0, 0, 0);
+    elementwise(
+        gpu,
         &gpu.kernels.add,
-        &[&a.buffer, &b.buffer, &out.buffer, &params],
-        (elementwise_groups(n as usize, max_groups), 1, 1),
+        &[&a.buffer, &b.buffer, &out.buffer],
+        params,
+        max_groups,
     );
     Ok(out)
 }
@@ -64,19 +58,34 @@ impl Params4 {
     }
 }
 
+/// Dispatch a grid-stride elementwise kernel (D8): `buffers` in binding order, then `params` as
+/// the last binding, whose first field is the element count.
+fn elementwise(
+    gpu: &Gpu,
+    pipeline: &wgpu::ComputePipeline,
+    buffers: &[&wgpu::Buffer],
+    params: Params4,
+    max_groups: u32,
+) {
+    let uniform = gpu.uniform(&params);
+    let mut bindings = buffers.to_vec();
+    bindings.push(&uniform);
+    let groups = elementwise_groups(params.a as usize, max_groups);
+    gpu.dispatch(pipeline, &bindings, (groups, 1, 1));
+}
+
 /// Elementwise GPT-2 GELU (tanh approximation).
 pub fn gelu(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
     let out = gpu.alloc(x.shape());
     if x.is_empty() {
         return Ok(out);
     }
-    let n = len_u32(x.len())?;
-    let params = gpu.uniform(&Params4::new(n, 0, 0, 0));
-    let groups = elementwise_groups(x.len(), gpu.limits.max_compute_workgroups_per_dimension);
-    gpu.dispatch(
+    elementwise(
+        gpu,
         &gpu.kernels.gelu,
-        &[&x.buffer, &out.buffer, &params],
-        (groups, 1, 1),
+        &[&x.buffer, &out.buffer],
+        Params4::new(len_u32(x.len())?, 0, 0, 0),
+        gpu.limits.max_compute_workgroups_per_dimension,
     );
     Ok(out)
 }
@@ -91,43 +100,19 @@ pub fn embed(
     ids: &[u32],
     start: usize,
 ) -> Result<GpuTensor> {
-    let (&[v, e], &[n_ctx, e2]) = (wte.shape(), wpe.shape()) else {
-        return Err(Error::Shape(format!(
-            "embed: wte {:?} and wpe {:?} must be 2-D",
-            wte.shape(),
-            wpe.shape()
-        )));
-    };
-    if e != e2 {
-        return Err(Error::Shape(format!(
-            "embed: wte {:?} vs wpe {:?}",
-            wte.shape(),
-            wpe.shape()
-        )));
-    }
-    if start + ids.len() > n_ctx {
-        return Err(Error::Input(format!(
-            "positions {start}..{} exceed the context length {n_ctx}",
-            start + ids.len()
-        )));
-    }
-    if let Some(&bad) = ids.iter().find(|&&id| id as usize >= v) {
-        return Err(Error::Input(format!(
-            "token id {bad} is outside the vocab (size {v})"
-        )));
-    }
+    let e = shape::embed(wte.shape(), wpe.shape(), ids, start)?;
     let out = gpu.alloc(&[ids.len(), e]);
     if ids.is_empty() {
         return Ok(out);
     }
     let n = len_u32(ids.len() * e)?;
     let ids_buf = gpu.upload_u32(ids);
-    let params = gpu.uniform(&Params4::new(n, e as u32, start as u32, 0));
-    let groups = elementwise_groups(n as usize, gpu.limits.max_compute_workgroups_per_dimension);
-    gpu.dispatch(
+    elementwise(
+        gpu,
         &gpu.kernels.embed,
-        &[&wte.buffer, &wpe.buffer, &ids_buf, &out.buffer, &params],
-        (groups, 1, 1),
+        &[&wte.buffer, &wpe.buffer, &ids_buf, &out.buffer],
+        Params4::new(n, e as u32, start as u32, 0),
+        gpu.limits.max_compute_workgroups_per_dimension,
     );
     Ok(out)
 }
@@ -170,15 +155,8 @@ pub fn layer_norm(
     bias: &GpuTensor,
     eps: f32,
 ) -> Result<GpuTensor> {
+    shape::layer_norm(x.shape(), gain.shape(), bias.shape())?;
     let (rows, cols) = rows_cols(gpu, "layer_norm", x)?;
-    if gain.shape() != [cols as usize] || bias.shape() != [cols as usize] {
-        return Err(Error::Shape(format!(
-            "layer_norm: x {:?}, gain {:?}, bias {:?}",
-            x.shape(),
-            gain.shape(),
-            bias.shape()
-        )));
-    }
     let out = gpu.alloc(x.shape());
     if rows == 0 || cols == 0 {
         return Ok(out);
@@ -197,21 +175,7 @@ const LINEAR_TILE: usize = 16;
 
 /// `y = x @ w^T + b`: `x: [T, in]`, `w: [out, in]` (D7), `b: [out]` or none.
 pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) -> Result<GpuTensor> {
-    let (&[t, n_in], &[n_out, w_in]) = (x.shape(), w.shape()) else {
-        return Err(Error::Shape(format!(
-            "linear: x {:?} and w {:?} must be 2-D",
-            x.shape(),
-            w.shape()
-        )));
-    };
-    if n_in != w_in || b.is_some_and(|b| b.shape() != [n_out]) {
-        return Err(Error::Shape(format!(
-            "linear: x {:?}, w {:?}, b {:?}",
-            x.shape(),
-            w.shape(),
-            b.map(GpuTensor::shape)
-        )));
-    }
+    let (t, n_in, n_out) = shape::linear(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
     let out = gpu.alloc(&[t, n_out]);
     if t == 0 || n_out == 0 {
         return Ok(out);
@@ -262,20 +226,9 @@ struct AttentionParams {
 
 /// `[T, 3E]` -> `(T, E)`, checking that 3E splits into 3 x `n_head` heads.
 fn qkv_dims(op: &str, qkv: &GpuTensor, n_head: usize) -> Result<(usize, usize)> {
-    let &[t, three_e] = qkv.shape() else {
-        return Err(Error::Shape(format!(
-            "{op}: qkv {:?} must be 2-D",
-            qkv.shape()
-        )));
-    };
-    if n_head == 0 || three_e % (3 * n_head) != 0 {
-        return Err(Error::Shape(format!(
-            "{op}: qkv {:?} doesn't split into 3 x {n_head} heads",
-            qkv.shape()
-        )));
-    }
-    len_u32(t * three_e)?;
-    Ok((t, three_e / 3))
+    let (t, e) = shape::qkv(op, qkv.shape(), n_head)?;
+    len_u32(t * 3 * e)?;
+    Ok((t, e))
 }
 
 /// `[n_ctx, E]` cache buffers for `start + T` positions of width `e`.
@@ -315,13 +268,12 @@ pub fn kv_write(
     if t == 0 || e == 0 {
         return Ok(());
     }
-    let n = (t * e) as u32;
-    let params = gpu.uniform(&Params4::new(n, e as u32, start as u32, 0));
-    let groups = elementwise_groups(n as usize, gpu.limits.max_compute_workgroups_per_dimension);
-    gpu.dispatch(
+    elementwise(
+        gpu,
         &gpu.kernels.kv_write,
-        &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer, &params],
-        (groups, 1, 1),
+        &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer],
+        Params4::new((t * e) as u32, e as u32, start as u32, 0),
+        gpu.limits.max_compute_workgroups_per_dimension,
     );
     Ok(())
 }
