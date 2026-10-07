@@ -29,7 +29,7 @@ const GPT2_TOL: Tol = Tol {
 fn tiny_model_matches_cpu() {
     let g = gpu();
     let w = Weights::load(&tiny_dir()).unwrap();
-    let gw = GpuWeights::upload(g, &w);
+    let gw = GpuWeights::upload(g, &w).unwrap();
     let golden = json(&tiny_dir().join("golden.json"));
     let ids = ids(&golden["ids"]);
 
@@ -57,7 +57,7 @@ fn gpu_properties_hold_bitwise() {
         vocab_size: 37,
         ln_eps: 1e-5,
     };
-    let gw = GpuWeights::upload(g, &Weights::random(config, 7));
+    let gw = GpuWeights::upload(g, &Weights::random(config, 7)).unwrap();
     let ids = [5, 0, 36, 17, 17, 2, 30, 11];
     let full = g.read(&gpt2_gpu::forward(g, &gw, &ids).unwrap()).unwrap();
 
@@ -101,7 +101,7 @@ fn cached_decode_is_bitwise_full_recompute() {
     // D33: after every step, the cached logits have exactly the bits of recomputing the whole
     // prefix. Any position or cache-row mistake shows up here, however small its effect.
     let g = gpu();
-    let gw = GpuWeights::upload(g, &tiny_random());
+    let gw = GpuWeights::upload(g, &tiny_random()).unwrap();
     let ids = [5, 0, 36, 17, 17, 2, 30, 11, 8, 23, 1, 4, 9, 33, 12, 6]; // fills n_ctx = 16
     let mut cache = KvCache::new(g, &gw.config);
 
@@ -139,7 +139,7 @@ fn truncate_rewinds_to_an_exact_prefix() {
     // Decode past position 6, rewind to 6, take a different branch: the logits must be exactly
     // those of recomputing the new sequence, so no row past the cut leaks in.
     let g = gpu();
-    let gw = GpuWeights::upload(g, &tiny_random());
+    let gw = GpuWeights::upload(g, &tiny_random()).unwrap();
     let mut cache = KvCache::new(g, &gw.config);
     let ids = [5, 0, 36, 17, 17, 2, 30, 11, 8];
     gpt2_gpu::extend(g, &gw, &mut cache, &ids).unwrap();
@@ -158,7 +158,7 @@ fn a_cache_for_another_model_is_rejected() {
     // Same width and context, one layer fewer: every per-layer shape check passes, so only the
     // layer count can tell. The cache must stay empty afterwards.
     let g = gpu();
-    let gw = GpuWeights::upload(g, &tiny_random());
+    let gw = GpuWeights::upload(g, &tiny_random()).unwrap();
     let one_layer = Config {
         n_layer: 1,
         ..gw.config.clone()
@@ -190,7 +190,7 @@ fn gpt2_cached_decode_is_bitwise_full_recompute() {
         return;
     };
     let g = gpu();
-    let gw = GpuWeights::upload(g, &Weights::load(dir.parent().unwrap()).unwrap());
+    let gw = GpuWeights::upload(g, &Weights::load(dir.parent().unwrap()).unwrap()).unwrap();
     let manifest = json(&dir.join("manifest.json"));
     let p = &manifest["prompts"][0];
     let mut seq = ids(&p["ids"]);
@@ -213,7 +213,7 @@ fn gpt2_matches_cpu() {
     };
     let g = gpu();
     let w = Weights::load(dir.parent().unwrap()).unwrap();
-    let gw = GpuWeights::upload(g, &w);
+    let gw = GpuWeights::upload(g, &w).unwrap();
     let manifest = json(&dir.join("manifest.json"));
 
     for p in manifest["prompts"].as_array().unwrap() {

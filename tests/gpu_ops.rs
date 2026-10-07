@@ -76,7 +76,7 @@ fn embed_matches_cpu_exactly() {
     let (v, e, n_ctx) = (37, 12, 16);
     let wte = random(&[v, e], -1.0, 1.0, 1);
     let wpe = random(&[n_ctx, e], -1.0, 1.0, 2);
-    let (gwte, gwpe) = (g.upload(&wte), g.upload(&wpe));
+    let (gwte, gwpe) = (g.upload(&cpu::transpose(&wte).unwrap()), g.upload(&wpe));
     let cases: [&[u32]; 4] = [&[0], &[36, 0, 5, 5], &[7; 16], &[]];
     for ids in cases {
         compare(
@@ -198,31 +198,52 @@ fn layer_norm_matches_cpu() {
 // ------------------------------------------------------------------ linear
 
 /// Same summation order as the CPU, so the nonzero error (measured worst 2.9e-6 at n_in = 3072)
-/// is fused multiply-add: the GPU rounds `acc + x * w` once, the CPU twice.
+/// is fused multiply-add: the GPU rounds `acc + x * w` once, the CPU twice. The same for all three
+/// kernels: each sums k = 0, 1, ... serially (D46).
 const LINEAR_TOL: Tol = Tol {
     abs: 1e-5,
     rel: 1e-5,
 };
 
+/// `(x, w, b)` for a `(T, in, out)` case, `w` in the CPU's `[out, in]`.
+fn linear_case(t: usize, n_in: usize, n_out: usize, seed: u64) -> (Tensor, Tensor, Tensor) {
+    (
+        random(&[t, n_in], -1.0, 1.0, seed),
+        random(&[n_out, n_in], -0.1, 0.1, 100 + seed),
+        random(&[n_out], -1.0, 1.0, 200 + seed),
+    )
+}
+
 #[test]
 fn linear_matches_cpu() {
     let g = gpu();
-    // (T, in, out): single elements, workgroup edges (16), odd sizes, and GPT-2's shapes.
+    // (T, in, out). T = 1 runs the matvec, T > 1 the 64 x 64 tiled matmul. Edges: one element,
+    // tile edges (64 rows and columns, 16-deep k steps, 256-wide matvec chunks) and one past
+    // them, odd sizes, and GPT-2's shapes, including the LM head's 50257 columns.
     let shapes = [
         (1, 1, 1),
-        (1, 16, 16),
+        (2, 1, 1),
+        (1, 255, 257),
+        (1, 257, 255),
+        (64, 16, 64),
+        (65, 17, 65),
+        (63, 15, 63),
         (17, 33, 15),
-        (16, 16, 17),
+        (1, 768, 2304),
         (3, 768, 2304),
+        (130, 768, 2304),
+        (1, 3072, 768),
         (5, 3072, 768),
+        (1, 768, 50257),
         (2, 768, 50257),
     ];
     for (seed, (t, n_in, n_out)) in shapes.into_iter().enumerate() {
-        let s = seed as u64;
-        let x = random(&[t, n_in], -1.0, 1.0, s);
-        let w = random(&[n_out, n_in], -0.1, 0.1, 100 + s);
-        let b = random(&[n_out], -1.0, 1.0, 200 + s);
-        let (gx, gw, gb) = (g.upload(&x), g.upload(&w), g.upload(&b));
+        let (x, w, b) = linear_case(t, n_in, n_out, seed as u64);
+        let (gx, gw, gb) = (
+            g.upload(&x),
+            g.upload(&cpu::transpose(&w).unwrap()),
+            g.upload(&b),
+        );
         compare(
             &format!("linear ({t}, {n_in}, {n_out})"),
             &cpu::linear(&x, &w, Some(&b)).unwrap(),
@@ -242,14 +263,80 @@ fn linear_matches_cpu() {
 }
 
 #[test]
+fn linear_naive_matches_cpu() {
+    let g = gpu();
+    for (seed, (t, n_in, n_out)) in [(1, 1, 1), (17, 33, 15), (16, 16, 17), (5, 3072, 768)]
+        .into_iter()
+        .enumerate()
+    {
+        let (x, w, b) = linear_case(t, n_in, n_out, seed as u64);
+        let (gx, gw, gb) = (g.upload(&x), g.upload(&w), g.upload(&b));
+        compare(
+            &format!("linear_naive ({t}, {n_in}, {n_out})"),
+            &cpu::linear(&x, &w, Some(&b)).unwrap(),
+            LINEAR_TOL,
+            || {
+                g.read(&ops::linear_naive(g, &gx, &gw, Some(&gb)).unwrap())
+                    .unwrap()
+            },
+        );
+    }
+}
+
+/// D46: a row computed alone (matvec) has the same bits as that row inside a batch (tiled
+/// matmul), and as the naive kernel's: all three run the same fused multiply-adds in the same
+/// order. The decode-equals-recompute check (D33) depends on it.
+#[test]
+fn every_linear_kernel_gives_a_row_the_same_bits() {
+    let g = gpu();
+    let bits = |t: &Tensor| t.data().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (seed, (t, n_in, n_out)) in [(70, 777, 130), (5, 3072, 768), (3, 768, 2304)]
+        .into_iter()
+        .enumerate()
+    {
+        let (x, w, b) = linear_case(t, n_in, n_out, 50 + seed as u64);
+        let (gx, gb) = (g.upload(&x), g.upload(&b));
+        let gw = g.upload(&cpu::transpose(&w).unwrap());
+        let batch = g
+            .read(&ops::linear(g, &gx, &gw, Some(&gb)).unwrap())
+            .unwrap();
+        let naive = g
+            .read(&ops::linear_naive(g, &gx, &g.upload(&w), Some(&gb)).unwrap())
+            .unwrap();
+        assert_eq!(
+            bits(&naive),
+            bits(&batch),
+            "({t}, {n_in}, {n_out}) naive vs tiled"
+        );
+        for i in [0, t / 2, t - 1] {
+            let row = g.upload(&rows(&x, i, i + 1));
+            let alone = g
+                .read(&ops::linear(g, &row, &gw, Some(&gb)).unwrap())
+                .unwrap();
+            assert_eq!(
+                bits(&alone),
+                bits(&rows(&batch, i, i + 1)),
+                "({t}, {n_in}, {n_out}) row {i}"
+            );
+        }
+    }
+}
+
+#[test]
 fn linear_rejects_bad_shapes() {
     let g = gpu();
+    // x: [2, 3] needs w: [3, out] (GPU layout) or [out, 3] (naive, CPU layout).
     let x = g.upload(&Tensor::zeros(&[2, 3]));
-    let w = g.upload(&Tensor::zeros(&[4, 2]));
+    let w = g.upload(&Tensor::zeros(&[2, 4]));
     assert!(ops::linear(g, &x, &w, None).is_err());
-    let w = g.upload(&Tensor::zeros(&[4, 3]));
+    assert!(ops::linear_naive(g, &x, &w, None).is_err());
+    let w = g.upload(&Tensor::zeros(&[3, 4]));
+    assert!(ops::linear(g, &x, &w, None).is_ok());
     let b = g.upload(&Tensor::zeros(&[3]));
     assert!(ops::linear(g, &x, &w, Some(&b)).is_err());
+    let w = g.upload(&Tensor::zeros(&[4, 3]));
+    assert!(ops::linear(g, &x, &w, None).is_err());
+    assert!(ops::linear_naive(g, &x, &w, None).is_ok());
 }
 
 // ------------------------------------------------------------------ attention
@@ -456,7 +543,7 @@ fn embed_at_an_offset() {
     let wpe = random(&[n_ctx, e], -1.0, 1.0, 64);
     let ids = [3, 1, 4, 1, 5, 9, 2, 6];
     let want = cpu::embed(&wte, &wpe, &ids).unwrap();
-    let (gwte, gwpe) = (g.upload(&wte), g.upload(&wpe));
+    let (gwte, gwpe) = (g.upload(&cpu::transpose(&wte).unwrap()), g.upload(&wpe));
     let got = g
         .read(&ops::embed(g, &gwte, &gwpe, &ids[5..], 5).unwrap())
         .unwrap();

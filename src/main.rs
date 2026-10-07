@@ -1,6 +1,7 @@
 //! `ember` CLI: `info` (what GPU we got), `selftest` (GPU add vs the CPU reference),
 //! `tokenize` (GPT-2's BPE, step by step), `generate` (greedy GPT-2 on the GPU with a KV cache,
-//! or without one, or on the CPU reference) and `bench` (prefill and decode timings, D35).
+//! or without one, or on the CPU reference), `bench` (prefill and decode timings, D35),
+//! `profile` (per-kernel GPU times, D36-D41) and `matmul` (the linear kernels vs the roofs, D47).
 //! Wall-clock timing lives here, in the CLI, never in the engine (D4).
 
 use std::io::Write;
@@ -15,7 +16,7 @@ use ember::profile::{self, KernelTime};
 use ember::rng::Rng;
 use ember::{Gpu, Tensor, Tokenizer, cpu, ops};
 
-const USAGE: &str = "usage: ember [info | selftest | tokenize <text>\n              | generate [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [-n <tokens>] <prompt>\n              | profile [-n <runs>] <prompt>]";
+const USAGE: &str = "usage: ember [info | selftest | tokenize <text>\n              | generate [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [-n <tokens>] <prompt>\n              | profile [-n <runs>] <prompt>\n              | matmul [-n <runs>]]";
 const GPT2_DIR: &str = "data/gpt2";
 
 fn main() -> ExitCode {
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
         Some("generate") => generate(&args[1..]),
         Some("bench") => bench(&args[1..]),
         Some("profile") => profile_cmd(&args[1..]),
+        Some("matmul") => matmul_cmd(&args[1..]),
         Some(other) => {
             eprintln!("unknown command or missing argument: `{other}`\n\n{USAGE}");
             return ExitCode::from(2);
@@ -142,7 +144,7 @@ fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         (out, secs, "CPU reference, no KV cache".to_string())
     } else {
         let gpu = Gpu::new()?;
-        let gw = GpuWeights::upload(&gpu, &w);
+        let gw = GpuWeights::upload(&gpu, &w)?;
         print!("{prompt}");
         std::io::stdout().flush()?;
         let start = Instant::now();
@@ -239,7 +241,7 @@ fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let gpu = Gpu::new()?;
-    let gw = GpuWeights::upload(&gpu, &w);
+    let gw = GpuWeights::upload(&gpu, &w)?;
     let mut cache = KvCache::new(&gpu, &w.config);
     let argmax = |l: &[f32]| -> Result<u32, Box<dyn std::error::Error>> {
         Ok(cpu::argmax(l).ok_or("logits contain NaN")? as u32)
@@ -401,7 +403,7 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("the prompt needs at most {} tokens", w.config.n_ctx - 1).into());
     }
     let gpu = Gpu::new()?;
-    let gw = GpuWeights::upload(&gpu, &w);
+    let gw = GpuWeights::upload(&gpu, &w)?;
     let mut cache = KvCache::new(&gpu, &w.config);
     let argmax = |l: &[f32]| -> ember::Result<u32> {
         cpu::argmax(l)
@@ -498,6 +500,131 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             100.0 * gbs / copy_gbs
         );
     }
+    Ok(())
+}
+
+/// `ember matmul [-n RUNS]` (D47): GPU time of each linear kernel on GPT-2's shapes, median of
+/// RUNS (default 5) after 1 warm-up. Prefill shapes report GFLOP/s against a measured compute
+/// roof (`fma_peak`); one-row shapes report weight GB/s against the copy roofline (D41). Random
+/// weights: no checkpoint needed.
+fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let runs = match args {
+        [] => 5,
+        [flag, v] if flag == "-n" => v.parse().map_err(|_| format!("-n: `{v}` is not a count"))?,
+        _ => return Err(format!("bad arguments\n\n{USAGE}").into()),
+    };
+    if runs == 0 {
+        return Err("-n: at least one measured run".into());
+    }
+    let gpu = Gpu::new()?;
+    println!(
+        "{} ({:?}), {} {}; median of {runs} after 1 warm-up; GPU time from timestamp queries",
+        gpu.info.name, gpu.info.backend, gpu.info.driver, gpu.info.driver_info
+    );
+    // Median GPU ms of the kernels one call of `op` dispatches.
+    let time = |op: &dyn Fn() -> ember::Result<ember::GpuTensor>| -> Result<f64, Box<dyn std::error::Error>> {
+        let mut samples = Vec::new();
+        for run in 0..=runs {
+            let (out, s) = measure(&gpu, op)?;
+            drop(out);
+            if run > 0 {
+                samples.push(s);
+            }
+        }
+        Ok(step_ms(&samples).0)
+    };
+
+    // Compute roof: 4096 x 256 invocations, 8 chains x 2048 steps each = 34.4 GFLOP.
+    let (groups, iters) = (4096u32, 2048u32);
+    let peak_ms = time(&|| ops::fma_peak(&gpu, groups, iters))?;
+    let peak_flops = 2.0 * (ops::FMA_PEAK_CHAINS * iters as usize * 256 * groups as usize) as f64;
+    let peak = peak_flops / (peak_ms * 1e6);
+    // Bandwidth roof (D41).
+    let n = 64 << 20;
+    let src = gpu.upload(&Tensor::new(&[n], vec![1.0; n])?);
+    let copy_ms = time(&|| ops::copy(&gpu, &src))?;
+    let copy_gbs = 2.0 * (n * 4) as f64 / (copy_ms * 1e6);
+    drop(src);
+    println!("compute roof (fma_peak)  {peak:7.1} GFLOP/s");
+    println!("bandwidth roof (copy)    {copy_gbs:7.1} GB/s");
+
+    // GPT-2's block matrices (in, out), and the LM head.
+    let mats = [
+        ("qkv", 768, 2304),
+        ("attn_out", 768, 768),
+        ("fc", 768, 3072),
+        ("fc_out", 3072, 768),
+        ("lm_head", 768, 50257),
+    ];
+    let mut rng = Rng::new(1);
+    let mut random = |shape: &[usize]| -> Result<ember::GpuTensor, Box<dyn std::error::Error>> {
+        let n = shape.iter().product();
+        Ok(gpu.upload(&Tensor::new(shape, rng.vec(n, -0.1, 0.1))?))
+    };
+
+    println!("\nprefill: GFLOP/s (% of the compute roof)");
+    println!(
+        "  {:<9} {:>5} {:>18} {:>18} {:>8}",
+        "matrix", "T", "naive", "tiled", "speedup"
+    );
+    for &(name, n_in, n_out) in &mats {
+        let w_out_in = random(&[n_out, n_in])?;
+        let w_in_out = random(&[n_in, n_out])?;
+        for t in [7, 128, 512] {
+            if name == "lm_head" && t > 7 {
+                continue; // generation runs the head on one row (D26)
+            }
+            let x = random(&[t, n_in])?;
+            let flops = 2.0 * (t * n_in * n_out) as f64;
+            let naive = time(&|| ops::linear_naive(&gpu, &x, &w_out_in, None))?;
+            let tiled = time(&|| ops::linear(&gpu, &x, &w_in_out, None))?;
+            let gf = |ms: f64| flops / (ms * 1e6);
+            println!(
+                "  {name:<9} {t:>5} {:>8.1} ({:>4.1}%) {:>8.1} ({:>4.1}%) {:>7.1}x",
+                gf(naive),
+                100.0 * gf(naive) / peak,
+                gf(tiled),
+                100.0 * gf(tiled) / peak,
+                naive / tiled
+            );
+        }
+    }
+
+    println!("\ndecode (T = 1): weight GB/s (% of the bandwidth roof)");
+    println!(
+        "  {:<9} {:>9} {:>18} {:>18} {:>8}",
+        "matrix", "MB", "naive", "matvec", "speedup"
+    );
+    let (mut naive_total, mut matvec_total, mut bytes_total) = (0.0, 0.0, 0.0);
+    for &(name, n_in, n_out) in &mats {
+        let w_out_in = random(&[n_out, n_in])?;
+        let w_in_out = random(&[n_in, n_out])?;
+        let x = random(&[1, n_in])?;
+        let bytes = 4.0 * (n_in * n_out) as f64;
+        let naive = time(&|| ops::linear_naive(&gpu, &x, &w_out_in, None))?;
+        let matvec = time(&|| ops::linear(&gpu, &x, &w_in_out, None))?;
+        let gbs = |ms: f64| bytes / (ms * 1e6);
+        // A decode step runs each block matrix 12 times and the head once.
+        let reps = if name == "lm_head" { 1.0 } else { 12.0 };
+        naive_total += reps * naive;
+        matvec_total += reps * matvec;
+        bytes_total += reps * bytes;
+        println!(
+            "  {name:<9} {:>9.1} {:>8.1} ({:>4.0}%) {:>8.1} ({:>4.0}%) {:>7.1}x",
+            bytes / 1e6,
+            gbs(naive),
+            100.0 * gbs(naive) / copy_gbs,
+            gbs(matvec),
+            100.0 * gbs(matvec) / copy_gbs,
+            naive / matvec
+        );
+    }
+    println!(
+        "  GPT-2 step: {:.0} MB of matrices, naive {naive_total:.2} ms, matvec {matvec_total:.2} ms = {:.1} GB/s ({:.0}% of the roof)",
+        bytes_total / 1e6,
+        bytes_total / (matvec_total * 1e6),
+        100.0 * bytes_total / (matvec_total * 1e6) / copy_gbs
+    );
     Ok(())
 }
 

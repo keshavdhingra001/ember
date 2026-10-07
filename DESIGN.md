@@ -488,3 +488,82 @@ What this says:
 - **Caveat on the roofline:** 26.7 GB/s is what this copy kernel achieves, a lower bound on the
   hardware's. The datasheet peak (LPDDR4x, ~50–68 GB/s) was not reached. The D35 note's "a fifth
   of the bandwidth" was against the datasheet; against the measured number it is about half.
+
+## M6: Fast matmul
+
+M5 found `linear` at 83–95% of every step (D42), so M6 replaces it. The naive kernel stays as
+the baseline (D49).
+
+### D43: Prefill matmul: shared-memory tiling with register blocks
+- **What:** `matmul.wgsl`. A 16×16 workgroup computes a 64×64 block of the output, and each
+  thread computes a 4×4 block of it in registers: rows `ty + 16r`, columns `tx + 16c`, so
+  neighbouring threads touch neighbouring columns. K is walked 16 at a time: the workgroup stages
+  a 64×16 slice of `x` and a 16×64 slice of `w` in shared memory (8 KiB), and every thread
+  does its 16×4×4 multiply-adds from there.
+- **Alternatives:** register blocking without shared memory; one thread per output (D19).
+- **Why:** naive does one global load per multiply-add. Here each staged value is used by 16
+  threads, and each loaded register value by 4 multiply-adds, which turns a memory-bound loop
+  into a compute-bound one. The strided 4×4 assignment, instead of a contiguous 4×4 block, makes
+  the inner loop's shared-memory reads and the final stores land on consecutive addresses.
+- **Global loads are scalar, not vec4** (the M6 table recommended vec4). GPT-2's LM head has
+  50257 columns, so `w` rows aren't 16-byte aligned. Consecutive threads read consecutive
+  scalars, which the hardware coalesces anyway. The tile sweep (D48) measured whether vec4 would
+  pay.
+
+### D44: Decode (T = 1) gets a matrix-vector kernel
+- **What:** `ops::linear` dispatches `matvec.wgsl` when `T = 1`, and `matmul` otherwise. The
+  matvec has one thread per output. At every k, a workgroup's 256 threads read 256 consecutive
+  floats of row k of `w`. `x` is staged in shared memory 256 values at a time, because every
+  thread needs the same `x[k]`.
+- **Alternatives:** one kernel for both.
+- **Why:** with one row, a 64-row tile computes 63 rows of nothing, and decode is memory-bound
+  anyway: what matters is reading each weight once, coalesced.
+
+### D45: GPU weights are `[in, out]`; the token table is stored only transposed
+- **What:** `GpuWeights::upload` transposes every linear weight back to `[in, out]` (the
+  checkpoint's own Conv1D layout). The token table is uploaded once, as `wte_t: [E, V]`: that is
+  the tied LM head's `[in, out]`, and `embed.wgsl` reads a token's embedding as column `id`
+  (E reads, V floats apart). The CPU oracle keeps `[out, in]` and `[V, E]` (D7).
+  `ops::linear_naive` takes the CPU layout.
+- **Alternatives (owner's choice, 2026-10-07):** keep both `wte` and `wte_t` (+154 MB); keep
+  `[V, E]` for the head and give the matvec a layout flag. Also considered: keep `[out, in]`
+  and split K across a workgroup, which is coalesced too but needs a tree sum (D46).
+- **Why:** in `[in, out]`, threads that own neighbouring outputs read neighbouring addresses at
+  every k, in both kernels. The LM head is 154 MB of a 495 MB decode step, so it has to be in the
+  fast layout too. One copy avoids 154 MB of extra memory on a GPU that shares system RAM. The
+  embed lookup's strided reads cost 768 loads per token. Upload transposes on the CPU once per
+  load.
+
+### D46: Decode stays bitwise equal to full recompute
+- **What:** `matmul`, `matvec` and `linear_naive` all compute each output as the serial sum
+  `acc = fma(x[k], w[k, o], acc)` for k = 0, 1, …, n_in − 1, then add the bias. The tiled kernel
+  stops its last K step at n_in instead of multiplying zero padding. A test checks that every row
+  has the same bits from all three kernels, in a batch or alone.
+- **Alternatives:** split-K in the matvec (more parallelism, a different summation order) with
+  a tolerance between decode and recompute.
+- **Why:** D33's bitwise check catches cache bugs a tolerance would hide, and it only holds if
+  a row's bits don't depend on the batch it ran in. The kernels use WGSL's `fma()` explicitly.
+  WGSL lets an implementation evaluate `fma` as a fused or an unfused multiply-add, so equal bits
+  across kernels are a property this driver is *tested* for, not one the language guarantees.
+  If a driver breaks it, the test says so.
+- **Revisit if:** the matvec is under ~70% of the bandwidth roofline. Only `n_out` threads run
+  (768 for `attn_out` and `fc_out`), which may be too few to hide memory latency. The fix would
+  be split-K with a fixed combine order, and the tiled kernel would combine in the same order.
+  That's a design change and goes back to the owner.
+
+### D47: Measuring M6
+- **What:** `ember matmul` times naive vs tiled vs matvec on GPT-2's shapes with timestamp
+  queries (median of 5 after 1 warm-up). It reports GFLOP/s for the matmuls, against a measured
+  compute roof (a kernel of independent FMA chains), and GB/s of weights for the matvec, against
+  the copy roofline (D41). The model-level before/after is `ember profile`, run back to back on
+  the same machine state.
+- **Why:** a matmul is judged against what the hardware can do, not against the old kernel only.
+
+### D48: Tile sizes from a small sweep, fixed as constants
+- **What:** a few configurations were measured with `ember matmul` and the best is compiled
+  in. No runtime autotuning.
+- **Why:** one target GPU for now; autotuning is machinery without a second device to justify it.
+
+### D49: The naive kernel stays, as `linear_naive`
+- **Why:** it's the benchmark's baseline, and an independent implementation to compare the
+  tiled kernels with bit for bit (D46).

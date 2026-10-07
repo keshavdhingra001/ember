@@ -36,10 +36,13 @@ pub(crate) struct Kernels {
     pub embed: Kernel,
     pub softmax: Kernel,
     pub layer_norm: Kernel,
-    pub linear: Kernel,
+    pub linear_naive: Kernel,
+    pub matmul: Kernel,
+    pub matvec: Kernel,
     pub attention: Kernel,
     pub kv_write: Kernel,
     pub copy: Kernel,
+    pub fma_peak: Kernel,
 }
 
 impl Gpu {
@@ -90,13 +93,16 @@ impl Gpu {
                 "layer_norm",
                 &with_reduce(include_str!("shaders/layer_norm.wgsl")),
             ),
-            linear: k("linear", include_str!("shaders/linear.wgsl")),
+            linear_naive: k("linear_naive", include_str!("shaders/linear_naive.wgsl")),
+            matmul: k("matmul", include_str!("shaders/matmul.wgsl")),
+            matvec: k("matvec", include_str!("shaders/matvec.wgsl")),
             attention: k(
                 "attention",
                 &with_reduce(include_str!("shaders/attention.wgsl")),
             ),
             kv_write: k("kv_write", include_str!("shaders/kv_write.wgsl")),
             copy: k("copy", include_str!("shaders/copy.wgsl")),
+            fma_peak: k("fma_peak", include_str!("shaders/fma_peak.wgsl")),
         };
         Ok(Gpu {
             device,

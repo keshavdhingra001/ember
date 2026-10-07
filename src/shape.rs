@@ -27,6 +27,20 @@ pub(crate) fn linear(
     Ok((t, n_in, n_out))
 }
 
+/// The GPU layout (D45): `x: [T, in]`, `w: [in, out]`, `b: [out]` or none -> `(T, in, out)`.
+pub(crate) fn linear_in_out(
+    x: &[usize],
+    w: &[usize],
+    b: Option<&[usize]>,
+) -> Result<(usize, usize, usize)> {
+    match w {
+        &[n_in, n_out] => linear(x, &[n_out, n_in], b),
+        _ => Err(Error::Shape(format!(
+            "linear: x {x:?} and w {w:?} must be 2-D"
+        ))),
+    }
+}
+
 /// `x: [rows, cols]` with `gain`, `bias`: `[cols]` -> `(rows, cols)`.
 pub(crate) fn layer_norm(x: &[usize], gain: &[usize], bias: &[usize]) -> Result<(usize, usize)> {
     let &[rows, cols] = x else {

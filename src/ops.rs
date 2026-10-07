@@ -91,16 +91,23 @@ pub fn gelu(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
 }
 
 /// `out[t] = wte[ids[t]] + wpe[start + t]`: token embedding plus the embedding of its absolute
-/// position (`start` > 0 when decoding after a cached prefix, D32). Ids and positions are
-/// checked here: the kernel would silently read the wrong row (or a clamped one, D9).
+/// position (`start` > 0 when decoding after a cached prefix, D32). The token table comes
+/// transposed, `wte_t: [E, V]` (D45). Ids and positions are checked here: the kernel would
+/// silently read the wrong row (or a clamped one, D9).
 pub fn embed(
     gpu: &Gpu,
-    wte: &GpuTensor,
+    wte_t: &GpuTensor,
     wpe: &GpuTensor,
     ids: &[u32],
     start: usize,
 ) -> Result<GpuTensor> {
-    let e = shape::embed(wte.shape(), wpe.shape(), ids, start)?;
+    let &[e_rows, v] = wte_t.shape() else {
+        return Err(Error::Shape(format!(
+            "embed: wte_t {:?} must be 2-D",
+            wte_t.shape()
+        )));
+    };
+    let e = shape::embed(&[v, e_rows], wpe.shape(), ids, start)?;
     let out = gpu.alloc(&[ids.len(), e]);
     if ids.is_empty() {
         return Ok(out);
@@ -110,8 +117,8 @@ pub fn embed(
     elementwise(
         gpu,
         &gpu.kernels.embed,
-        &[&wte.buffer, &wpe.buffer, &ids_buf, &out.buffer],
-        Params4::new(n, e as u32, start as u32, 0),
+        &[&wte_t.buffer, &wpe.buffer, &ids_buf, &out.buffer],
+        Params4::new(n, e as u32, start as u32, len_u32(v)?),
         gpu.limits.max_compute_workgroups_per_dimension,
     );
     Ok(out)
@@ -170,19 +177,62 @@ pub fn layer_norm(
     Ok(out)
 }
 
-/// Threads per side of the 2-D `linear` workgroup. Must match `@workgroup_size(16, 16)`.
-const LINEAR_TILE: usize = 16;
+/// Threads per side of `linear_naive`'s 2-D workgroup. Must match `@workgroup_size(16, 16)`.
+const NAIVE_TILE: usize = 16;
 
-/// `y = x @ w^T + b`: `x: [T, in]`, `w: [out, in]` (D7), `b: [out]` or none.
+/// Rows and columns of the output per `matmul` workgroup. Must match `BM` and `BN` in matmul.wgsl.
+const MATMUL_TILE: usize = 64;
+
+/// Outputs per `matvec` workgroup. Must match `WG` in matvec.wgsl.
+const MATVEC_WG: usize = 256;
+
+/// `y = x @ w + b`: `x: [T, in]`, `w: [in, out]` (the GPU layout, D45), `b: [out]` or none.
+/// One row (a decode step) goes to the matrix-vector kernel, more rows to the tiled matmul
+/// (D43, D44). Both compute each output with the same serial sequence of fused multiply-adds,
+/// so a row's bits don't depend on which kernel ran it or what else was in the batch (D46).
 pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) -> Result<GpuTensor> {
-    let (t, n_in, n_out) = shape::linear(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
+    let (t, n_in, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
+    let dims = (t, n_in, n_out);
+    if t == 1 {
+        let groups = (n_out.div_ceil(MATVEC_WG), 1);
+        linear_dispatch(gpu, &gpu.kernels.matvec, x, w, b, dims, groups)
+    } else {
+        let groups = (n_out.div_ceil(MATMUL_TILE), t.div_ceil(MATMUL_TILE));
+        linear_dispatch(gpu, &gpu.kernels.matmul, x, w, b, dims, groups)
+    }
+}
+
+/// The M2 kernel (D19), kept as M6's baseline and as a second differential check (D49):
+/// `y = x @ w^T + b` with `w: [out, in]`, the CPU's layout (D7).
+pub fn linear_naive(
+    gpu: &Gpu,
+    x: &GpuTensor,
+    w: &GpuTensor,
+    b: Option<&GpuTensor>,
+) -> Result<GpuTensor> {
+    let dims = shape::linear(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
+    let (t, _, n_out) = dims;
+    let groups = (n_out.div_ceil(NAIVE_TILE), t.div_ceil(NAIVE_TILE));
+    linear_dispatch(gpu, &gpu.kernels.linear_naive, x, w, b, dims, groups)
+}
+
+/// Shared by the three linear kernels: they take the same bindings and `(t, in, out, has_bias)`
+/// parameters, `dims = (t, in, out)` already checked against the kernel's weight layout.
+fn linear_dispatch(
+    gpu: &Gpu,
+    kernel: &Kernel,
+    x: &GpuTensor,
+    w: &GpuTensor,
+    b: Option<&GpuTensor>,
+    (t, n_in, n_out): (usize, usize, usize),
+    (gx, gy): (usize, usize),
+) -> Result<GpuTensor> {
     let out = gpu.alloc(&[t, n_out]);
     if t == 0 || n_out == 0 {
         return Ok(out);
     }
     len_u32(t * n_in.max(n_out))?;
     len_u32(n_out * n_in)?;
-    let (gx, gy) = (n_out.div_ceil(LINEAR_TILE), t.div_ceil(LINEAR_TILE));
     let max = gpu.limits.max_compute_workgroups_per_dimension as usize;
     if gx > max || gy > max {
         return Err(Error::Shape(format!(
@@ -206,7 +256,7 @@ pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) ->
         }
     };
     gpu.dispatch(
-        &gpu.kernels.linear,
+        kernel,
         &[&x.buffer, &w.buffer, bias, &out.buffer, &params],
         (gx as u32, gy as u32, 1),
     );
@@ -363,6 +413,28 @@ pub fn copy_with_max_groups(gpu: &Gpu, x: &GpuTensor, max_groups: u32) -> Result
         &[&x.buffer, &out.buffer],
         Params4::new(len_u32(x.len() / 4)?, 0, 0, 0),
         max_groups,
+    );
+    Ok(out)
+}
+
+/// Fused multiply-adds per invocation and step of `fma_peak`. Must match `CHAINS` in the shader.
+pub const FMA_PEAK_CHAINS: usize = 8;
+
+/// The compute-roof probe (D47): `groups` workgroups of 256 invocations each run
+/// `FMA_PEAK_CHAINS` independent fma chains for `iters` steps, which is
+/// `2 * FMA_PEAK_CHAINS * iters * 256 * groups` flops. Returns one value per invocation, so the
+/// work can't be optimised away. Like `copy`, it exists to be timed.
+pub fn fma_peak(gpu: &Gpu, groups: u32, iters: u32) -> Result<GpuTensor> {
+    let n = groups as usize * ELEMENTWISE_WG as usize;
+    if groups == 0 || groups > gpu.limits.max_compute_workgroups_per_dimension {
+        return Err(Error::Shape(format!("fma_peak: {groups} workgroups")));
+    }
+    let out = gpu.alloc(&[n]);
+    let params = gpu.uniform(&Params4::new(iters, 0, 0, 0));
+    gpu.dispatch(
+        &gpu.kernels.fma_peak,
+        &[&out.buffer, &params],
+        (groups, 1, 1),
     );
     Ok(out)
 }

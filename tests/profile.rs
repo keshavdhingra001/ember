@@ -40,40 +40,41 @@ fn one_label_and_time_per_dispatch_in_order() {
         vocab_size: 37,
         ln_eps: 1e-5,
     };
-    let gw = GpuWeights::upload(g, &Weights::random(config, 7));
+    let gw = GpuWeights::upload(g, &Weights::random(config, 7)).unwrap();
     let mut cache = KvCache::new(g, &gw.config);
 
     g.profile_start().unwrap();
     gpt2_gpu::extend(g, &gw, &mut cache, &[1, 2, 3]).unwrap();
     let times = g.profile_finish().unwrap();
 
+    // Three rows: the block's matrices run on the tiled matmul (D43).
     let block = [
         "layer_norm",
-        "linear",
+        "matmul",
         "kv_write",
         "attention",
-        "linear",
+        "matmul",
         "add",
         "layer_norm",
-        "linear",
+        "matmul",
         "gelu",
-        "linear",
+        "matmul",
         "add",
     ];
     let mut want = vec!["embed"];
     want.extend(block);
     want.extend(block);
-    want.extend(["layer_norm", "linear"]); // ln_f, then the LM head on the last row
+    want.extend(["layer_norm", "matvec"]); // ln_f, then the LM head on the last row (D44)
     let got: Vec<&str> = times.iter().map(|t| t.kernel).collect();
     assert_eq!(got, want);
     for t in &times {
         assert!(t.ns.is_finite() && t.ns > 0.0 && t.ns < 1e9, "{t:?}");
     }
-    let linear = by_kernel(&times)
+    let matmul = by_kernel(&times)
         .into_iter()
-        .find(|k| k.0 == "linear")
+        .find(|k| k.0 == "matmul")
         .unwrap();
-    assert_eq!(linear.1, 9);
+    assert_eq!(matmul.1, 8);
 }
 
 #[test]
@@ -81,7 +82,7 @@ fn profiling_does_not_change_results() {
     // D4, D37: the same logits, bit for bit, with timestamps on and off.
     let _turn = ONE_AT_A_TIME.lock().unwrap();
     let Some(g) = profiling_gpu() else { return };
-    let gw = GpuWeights::upload(g, &Weights::load(&tiny_dir()).unwrap());
+    let gw = GpuWeights::upload(g, &Weights::load(&tiny_dir()).unwrap()).unwrap();
     let ids = [3, 1, 4, 1, 5, 9, 2, 6];
     let plain = gpt2_gpu::next_logits(g, &gw, &ids).unwrap();
     g.profile_start().unwrap();

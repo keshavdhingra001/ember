@@ -2,9 +2,9 @@
 // Naive (D19): one invocation per output element, a serial dot product in the CPU's order.
 // 16 x 16 workgroups: gid.x walks output features, gid.y rows.
 //
-// Known weakness, kept on purpose as M6's baseline: threads with neighbouring `o` read rows of
-// w that are n_in floats apart, so their loads don't coalesce, and nothing is reused through
-// shared memory.
+// Not used by the model since M6 (D49): it is the baseline the tiled kernels are measured
+// against, in the CPU's [out, in] layout. Threads with neighbouring `o` read rows of w that are
+// n_in floats apart, so their loads don't coalesce, and nothing is reused through shared memory.
 
 struct Params {
     t: u32,

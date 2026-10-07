@@ -1,18 +1,21 @@
 //! GPT-2 on the GPU (M3): the forward pass of `forward.rs`, op for op, with the M2 kernels.
-//! Weights are uploaded once (D24); each op submits its own dispatch (D25); nothing is read
-//! back until the logits.
+//! Weights are uploaded once (D24), every matrix in the `[in, out]` layout the GPU's matmul
+//! kernels read fast (D45); each op submits its own dispatch (D25); nothing is read back until
+//! the logits.
 //!
 //! Two ways to run it: `forward` / `next_logits` recompute the whole sequence (M3, the
 //! comparison partner for D33), and `extend` runs only new tokens against a `KvCache` (M4).
 
+use crate::cpu;
 use crate::error::{Error, Result};
 use crate::gpt2::forward::greedy;
 use crate::gpt2::{Config, Linear, Norm, Weights};
 use crate::gpu::Gpu;
 use crate::ops;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, Tensor};
 
 pub struct GpuLinear {
+    /// `[in, out]`: the transpose of the CPU's `[out, in]` (D45).
     pub w: GpuTensor,
     pub b: GpuTensor,
 }
@@ -31,50 +34,58 @@ pub struct GpuBlock {
     pub fc_out: GpuLinear,
 }
 
-/// `Weights` in GPU buffers, same layout (D7, D24).
+/// `Weights` in GPU buffers (D24), matrices transposed to `[in, out]` (D45).
 pub struct GpuWeights {
     pub config: Config,
-    pub wte: GpuTensor,
+    /// The token table transposed, `[E, V]`: the tied LM head's `[in, out]`, and the only copy
+    /// (D45). `ops::embed` reads a token's column.
+    pub wte_t: GpuTensor,
     pub wpe: GpuTensor,
     pub blocks: Vec<GpuBlock>,
     pub ln_f: GpuNorm,
 }
 
 impl GpuWeights {
-    pub fn upload(gpu: &Gpu, w: &Weights) -> Self {
-        let linear = |l: &Linear| GpuLinear {
-            w: gpu.upload(&l.w),
-            b: gpu.upload(&l.b),
+    pub fn upload(gpu: &Gpu, w: &Weights) -> Result<Self> {
+        let transposed = |t: &Tensor| -> Result<GpuTensor> { Ok(gpu.upload(&cpu::transpose(t)?)) };
+        let linear = |l: &Linear| -> Result<GpuLinear> {
+            Ok(GpuLinear {
+                w: transposed(&l.w)?,
+                b: gpu.upload(&l.b),
+            })
         };
         let norm = |n: &Norm| GpuNorm {
             gain: gpu.upload(&n.gain),
             bias: gpu.upload(&n.bias),
         };
-        GpuWeights {
-            config: w.config.clone(),
-            wte: gpu.upload(&w.wte),
-            wpe: gpu.upload(&w.wpe),
-            blocks: w
-                .blocks
-                .iter()
-                .map(|b| GpuBlock {
+        let blocks = w
+            .blocks
+            .iter()
+            .map(|b| {
+                Ok(GpuBlock {
                     ln_1: norm(&b.ln_1),
-                    qkv: linear(&b.qkv),
-                    attn_out: linear(&b.attn_out),
+                    qkv: linear(&b.qkv)?,
+                    attn_out: linear(&b.attn_out)?,
                     ln_2: norm(&b.ln_2),
-                    fc: linear(&b.fc),
-                    fc_out: linear(&b.fc_out),
+                    fc: linear(&b.fc)?,
+                    fc_out: linear(&b.fc_out)?,
                 })
-                .collect(),
+            })
+            .collect::<Result<_>>()?;
+        Ok(GpuWeights {
+            config: w.config.clone(),
+            wte_t: transposed(&w.wte)?,
+            wpe: gpu.upload(&w.wpe),
+            blocks,
             ln_f: norm(&w.ln_f),
-        }
+        })
     }
 }
 
 /// Logits for every position, `[T, V]`, left on the GPU.
 pub fn forward(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<GpuTensor> {
     let h = hidden(gpu, w, ids)?;
-    ops::linear(gpu, &h, &w.wte, None)
+    ops::linear(gpu, &h, &w.wte_t, None)
 }
 
 /// Final hidden states after `ln_f`, `[T, E]`.
@@ -82,7 +93,7 @@ pub fn hidden(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<GpuTensor> {
     if ids.is_empty() {
         return Err(Error::Input("empty token sequence".into()));
     }
-    let mut x = ops::embed(gpu, &w.wte, &w.wpe, ids, 0)?;
+    let mut x = ops::embed(gpu, &w.wte_t, &w.wpe, ids, 0)?;
     for b in &w.blocks {
         x = block(gpu, w, b, &x, |qkv| {
             ops::causal_attention(gpu, qkv, w.config.n_head)
@@ -124,7 +135,7 @@ pub fn next_logits(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<Vec<f32>> {
 /// The tied LM head on the last row of `h: [T, E]`, read back.
 fn last_logits(gpu: &Gpu, w: &GpuWeights, h: &GpuTensor) -> Result<Vec<f32>> {
     let last = ops::row(gpu, h, h.shape()[0] - 1)?;
-    let logits = ops::linear(gpu, &last, &w.wte, None)?;
+    let logits = ops::linear(gpu, &last, &w.wte_t, None)?;
     Ok(gpu.read(&logits)?.data().to_vec())
 }
 
@@ -205,7 +216,7 @@ pub fn hidden_cached(
             w.config.n_ctx
         )));
     }
-    let mut x = ops::embed(gpu, &w.wte, &w.wpe, ids, start)?;
+    let mut x = ops::embed(gpu, &w.wte_t, &w.wpe, ids, start)?;
     for (b, (k, v)) in w.blocks.iter().zip(&cache.layers) {
         x = block(gpu, w, b, &x, |qkv| {
             ops::kv_write(gpu, qkv, k, v, start)?;
