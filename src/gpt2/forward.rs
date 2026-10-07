@@ -76,6 +76,14 @@ pub fn generate_greedy(
     )
 }
 
+/// The highest-scoring token (the first on ties, D4). NaN logits are an error, not a token: they
+/// mean the model computed garbage.
+pub fn argmax_token(logits: &[f32]) -> Result<u32> {
+    cpu::argmax(logits)
+        .map(|i| i as u32)
+        .ok_or_else(|| Error::Input("logits contain NaN; the model is broken".into()))
+}
+
 /// The greedy loop, shared by the CPU reference and the GPU model (`gpt2::gpu`): only
 /// `next_logits` differs between them.
 pub(crate) fn greedy(
@@ -88,10 +96,7 @@ pub(crate) fn greedy(
     let mut ids = prompt.to_vec();
     let mut out = Vec::with_capacity(n);
     while out.len() < n && ids.len() < n_ctx {
-        let logits = next_logits(&ids)?;
-        let next = cpu::argmax(&logits)
-            .ok_or_else(|| Error::Input("logits contain NaN; the model is broken".into()))?
-            as u32;
+        let next = argmax_token(&next_logits(&ids)?)?;
         ids.push(next);
         out.push(next);
         on_token(next);

@@ -150,7 +150,7 @@ impl Gpu {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                contents: padded_bytes(t.data()),
+                contents: nonempty_bytes(t.data()),
                 usage: TENSOR_USAGE,
             });
         GpuTensor {
@@ -161,14 +161,17 @@ impl Gpu {
 
     /// A storage buffer of u32s (token ids). Not a `GpuTensor`: tensors are f32 (D7).
     pub(crate) fn upload_u32(&self, data: &[u32]) -> wgpu::Buffer {
-        const ZERO: [u32; 1] = [0];
-        let data = if data.is_empty() { &ZERO[..] } else { data };
         self.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("u32"),
-                contents: bytemuck::cast_slice(data),
+                contents: nonempty_bytes(data),
                 usage: wgpu::BufferUsages::STORAGE,
             })
+    }
+
+    /// Workgroups one dispatch dimension can hold.
+    pub fn max_groups(&self) -> u32 {
+        self.limits.max_compute_workgroups_per_dimension
     }
 
     /// An uninitialised-by-us (wgpu zero-fills it) tensor for a kernel to write into.
@@ -205,26 +208,7 @@ impl Gpu {
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(&t.buffer, 0, &staging, 0, size);
         self.queue.submit([enc.finish()]);
-
-        let (tx, rx) = mpsc::channel();
-        staging.map_async(wgpu::MapMode::Read, .., move |r| {
-            // The receiver outlives this callback (we block on it below).
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| Error::Readback(e.to_string()))?;
-        rx.recv()
-            .map_err(|e| Error::Readback(e.to_string()))?
-            .map_err(|e| Error::Readback(e.to_string()))?;
-
-        let data = {
-            let view = staging
-                .get_mapped_range(..)
-                .map_err(|e| Error::Readback(e.to_string()))?;
-            bytemuck::cast_slice::<u8, f32>(&view).to_vec()
-        };
-        staging.unmap();
+        let data = map_read(&self.device, &staging, size)?;
         Tensor::new(&t.shape, data)
     }
 
@@ -314,9 +298,40 @@ fn byte_size(n: usize) -> u64 {
     (n.max(1) * 4) as u64
 }
 
-fn padded_bytes(data: &[f32]) -> &[u8] {
-    const ZERO: [f32; 1] = [0.0];
-    bytemuck::cast_slice(if data.is_empty() { &ZERO } else { data })
+/// The bytes of `data`, or 4 zero bytes for an empty slice (for the same reason as `byte_size`).
+fn nonempty_bytes<T: bytemuck::Pod>(data: &[T]) -> &[u8] {
+    if data.is_empty() {
+        &[0; 4]
+    } else {
+        bytemuck::cast_slice(data)
+    }
+}
+
+/// Map the first `bytes` of a MAP_READ buffer and copy them out as `T`s. Waits for the GPU to
+/// finish everything submitted so far, including the copy that filled `buf`.
+pub(crate) fn map_read<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    buf: &wgpu::Buffer,
+    bytes: u64,
+) -> Result<Vec<T>> {
+    let (tx, rx) = mpsc::channel();
+    buf.map_async(wgpu::MapMode::Read, ..bytes, move |r| {
+        // The receiver outlives this callback (we block on it below).
+        let _ = tx.send(r);
+    });
+    let readback = |e: &dyn std::fmt::Display| Error::Readback(e.to_string());
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| readback(&e))?;
+    rx.recv()
+        .map_err(|e| readback(&e))?
+        .map_err(|e| readback(&e))?;
+    let data = {
+        let view = buf.get_mapped_range(..bytes).map_err(|e| readback(&e))?;
+        bytemuck::cast_slice::<u8, T>(&view).to_vec()
+    };
+    buf.unmap();
+    Ok(data)
 }
 
 /// Compile `wgsl`'s `main` with values for its `override` constants (D48).

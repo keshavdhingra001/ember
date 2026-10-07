@@ -14,10 +14,12 @@ use ember::gpt2::gpu::{self as gpt2_gpu, GpuWeights, KvCache};
 use ember::gpt2::{self, Weights};
 use ember::profile::{self, KernelTime};
 use ember::rng::Rng;
-use ember::{Gpu, Tensor, Tokenizer, cpu, ops};
+use ember::{Gpu, GpuTensor, Tensor, Tokenizer, cpu, ops};
 
 const USAGE: &str = "usage: ember [info | selftest | tokenize <text>\n              | generate [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [-n <tokens>] <prompt>\n              | profile [-n <runs>] <prompt>\n              | matmul [-n <runs>]]";
 const GPT2_DIR: &str = "data/gpt2";
+
+type CliResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,7 +45,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn info() -> Result<(), Box<dyn std::error::Error>> {
+fn info() -> CliResult {
     let gpu = Gpu::new()?;
     let i = &gpu.info;
     let l = &gpu.limits;
@@ -74,7 +76,7 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn selftest() -> Result<(), Box<dyn std::error::Error>> {
+fn selftest() -> CliResult {
     let gpu = Gpu::new()?;
     let n = 1 << 20;
     let mut rng = Rng::new(42);
@@ -97,7 +99,7 @@ fn selftest() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Print each pre-split word and the tokens BPE made of it.
-fn tokenize(text: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn tokenize(text: &str) -> CliResult {
     let tok = Tokenizer::load(Path::new(GPT2_DIR))?;
     let mut total = 0;
     for word in tok.split(text)? {
@@ -120,13 +122,13 @@ fn tokenize(text: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Greedy GPT-2, streaming tokens as they come: on the GPU with a KV cache (D29), on the GPU
 /// recomputing everything with `--no-cache` (M3), or on the CPU reference with `--cpu`.
-fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn generate(args: &[String]) -> CliResult {
     let Opts {
         n,
         cpu: cpu_ref,
         no_cache,
         prompt,
-    } = parse_opts(args, 20, &["--cpu", "--no-cache"])?;
+    } = prompt_opts(args, 20, &["--cpu", "--no-cache"])?;
     let (tok, w, ids) = load_gpt2(&prompt)?;
 
     let mut pending = Vec::new();
@@ -168,7 +170,7 @@ fn generate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The tokenizer and weights from `data/gpt2/`, and the prompt's token ids.
-fn load_gpt2(prompt: &str) -> Result<(Tokenizer, Weights, Vec<u32>), Box<dyn std::error::Error>> {
+fn load_gpt2(prompt: &str) -> CliResult<(Tokenizer, Weights, Vec<u32>)> {
     let dir = Path::new(GPT2_DIR);
     let tok = Tokenizer::load(dir)?;
     let w = Weights::load(dir)?;
@@ -177,7 +179,7 @@ fn load_gpt2(prompt: &str) -> Result<(Tokenizer, Weights, Vec<u32>), Box<dyn std
 }
 
 /// Options before the prompt. `-n` and the flags a command allows come first, in any order;
-/// everything from the first other word on is the prompt.
+/// everything from the first other word on is the prompt (possibly empty; see `prompt_opts`).
 struct Opts {
     n: usize,
     cpu: bool,
@@ -185,11 +187,7 @@ struct Opts {
     prompt: String,
 }
 
-fn parse_opts(
-    args: &[String],
-    default_n: usize,
-    flags: &[&str],
-) -> Result<Opts, Box<dyn std::error::Error>> {
+fn parse_opts(args: &[String], default_n: usize, flags: &[&str]) -> CliResult<Opts> {
     let mut o = Opts {
         n: default_n,
         cpu: false,
@@ -218,17 +216,40 @@ fn parse_opts(
         }
     }
     o.prompt = rest.join(" ");
+    Ok(o)
+}
+
+/// `parse_opts` for a command that needs a prompt.
+fn prompt_opts(args: &[String], default_n: usize, flags: &[&str]) -> CliResult<Opts> {
+    let o = parse_opts(args, default_n, flags)?;
     if o.prompt.is_empty() {
         return Err(format!("missing prompt\n\n{USAGE}").into());
     }
     Ok(o)
 }
 
+/// `-n` as a count of measured runs: at least one.
+fn measured_runs(n: usize) -> CliResult<usize> {
+    if n == 0 {
+        return Err("-n: at least one measured run".into());
+    }
+    Ok(n)
+}
+
+/// The adapter and driver, for the first line of every report.
+fn device(gpu: &Gpu) -> String {
+    let i = &gpu.info;
+    format!(
+        "{} ({:?}), {} {}",
+        i.name, i.backend, i.driver, i.driver_info
+    )
+}
+
 /// `ember bench [-n N] <prompt>` (D35): prefill latency and decode rate with the KV cache, and
 /// the uncached rate for comparison. 1 warm-up run, then the median of 5, wall clock.
-fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn bench(args: &[String]) -> CliResult {
     const RUNS: usize = 5;
-    let Opts { n, prompt, .. } = parse_opts(args, 32, &[])?;
+    let Opts { n, prompt, .. } = prompt_opts(args, 32, &[])?;
     let (_, w, ids) = load_gpt2(&prompt)?;
     // The uncached run generates n + 1 tokens after the prompt. The greedy loop would quietly
     // stop at the context length and the rates below would then divide by the wrong count.
@@ -243,13 +264,11 @@ fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let gpu = Gpu::new()?;
     let gw = GpuWeights::upload(&gpu, &w)?;
     let mut cache = KvCache::new(&gpu, &w.config);
-    let argmax = |l: &[f32]| -> Result<u32, Box<dyn std::error::Error>> {
-        Ok(cpu::argmax(l).ok_or("logits contain NaN")? as u32)
-    };
+    let argmax = gpt2::argmax_token;
 
     // One cached run: (prefill seconds, decode seconds for n tokens). The decode clock covers
     // everything a real step does: the model, the 201 KB readback and the argmax.
-    let mut cached = || -> Result<(f64, f64), Box<dyn std::error::Error>> {
+    let mut cached = || -> CliResult<(f64, f64)> {
         cache.clear();
         let t0 = Instant::now();
         let mut next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &ids)?)?;
@@ -265,7 +284,7 @@ fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let prefill = median(runs.iter().map(|r| r.0).collect());
     let decode = median(runs.iter().map(|r| r.1).collect());
 
-    let uncached = || -> Result<f64, Box<dyn std::error::Error>> {
+    let uncached = || -> CliResult<f64> {
         let t = Instant::now();
         gpt2_gpu::generate_greedy_uncached(&gpu, &gw, &ids, n + 1, |_| {})?;
         Ok(t.elapsed().as_secs_f64())
@@ -274,9 +293,8 @@ fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let full = median((0..RUNS).map(|_| uncached()).collect::<Result<_, _>>()?);
 
     println!(
-        "{} ({:?}); prompt {} tokens, {n} decode steps; median of {RUNS} after 1 warm-up, wall clock",
-        gpu.info.name,
-        gpu.info.backend,
+        "{}; prompt {} tokens, {n} decode steps; median of {RUNS} after 1 warm-up, wall clock",
+        device(&gpu),
         ids.len()
     );
     println!("prefill            {:8.1} ms", prefill * 1e3);
@@ -307,16 +325,42 @@ struct Sample {
 
 /// Run `step` with the profiler on. The wall clock stops when `step` returns, which for the
 /// model means after its logits were read back, so the GPU has finished.
-fn measure<T>(
-    gpu: &Gpu,
-    step: impl FnOnce() -> ember::Result<T>,
-) -> Result<(T, Sample), Box<dyn std::error::Error>> {
+fn measure<T>(gpu: &Gpu, step: impl FnOnce() -> ember::Result<T>) -> CliResult<(T, Sample)> {
     gpu.profile_start()?;
     let t = Instant::now();
     let out = step()?;
     let wall_ns = t.elapsed().as_secs_f64() * 1e9;
     let kernels = gpu.profile_finish()?;
     Ok((out, Sample { kernels, wall_ns }))
+}
+
+/// `runs` samples of `step`, after one warm-up run that is thrown away.
+fn sample_runs<T>(
+    gpu: &Gpu,
+    runs: usize,
+    mut step: impl FnMut() -> ember::Result<T>,
+) -> CliResult<Vec<Sample>> {
+    let mut samples = Vec::with_capacity(runs);
+    for run in 0..=runs {
+        let (_, s) = measure(gpu, &mut step)?;
+        if run > 0 {
+            samples.push(s);
+        }
+    }
+    Ok(samples)
+}
+
+/// Median GPU ms of the kernels one call of `step` dispatches.
+fn gpu_ms<T>(gpu: &Gpu, runs: usize, step: impl FnMut() -> ember::Result<T>) -> CliResult<f64> {
+    Ok(step_ms(&sample_runs(gpu, runs, step)?).0)
+}
+
+/// Elements in the bandwidth probes' buffer: 256 MiB of f32.
+const PROBE_LEN: usize = 64 << 20;
+
+/// `x` per millisecond, in units of 1e9 per second (GB/s for bytes, GFLOP/s for flops).
+fn giga_per_s(x: f64, ms: f64) -> f64 {
+    x / (ms * 1e6)
 }
 
 /// Median per-step GPU ms of one kernel across samples (0 if it never ran).
@@ -368,36 +412,14 @@ fn print_table(title: &str, samples: &[Sample]) {
     );
 }
 
-/// Bytes of weights a decode step reads: every tensor once, except `wpe`, of which it reads one
-/// row. (`wte` is read whole by the tied LM head.)
-fn decode_weight_bytes(w: &Weights) -> f64 {
-    let norm = |n: &gpt2::Norm| n.gain.len() + n.bias.len();
-    let lin = |l: &gpt2::Linear| l.w.len() + l.b.len();
-    let blocks: usize = w
-        .blocks
-        .iter()
-        .map(|b| {
-            norm(&b.ln_1)
-                + lin(&b.qkv)
-                + lin(&b.attn_out)
-                + norm(&b.ln_2)
-                + lin(&b.fc)
-                + lin(&b.fc_out)
-        })
-        .sum();
-    4.0 * (blocks + norm(&w.ln_f) + w.wte.len()) as f64
-}
-
 /// `ember profile [-n RUNS] <prompt>` (D36-D41): per-kernel tables for the prefill and one
 /// decode step, a decode sweep over context positions, and the measured copy bandwidth. Every
 /// number is the median of RUNS (default 5) after 1 warm-up.
-fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn profile_cmd(args: &[String]) -> CliResult {
     let Opts {
         n: runs, prompt, ..
-    } = parse_opts(args, 5, &[])?;
-    if runs == 0 {
-        return Err("-n: at least one measured run".into());
-    }
+    } = prompt_opts(args, 5, &[])?;
+    let runs = measured_runs(runs)?;
     let (_, w, ids) = load_gpt2(&prompt)?;
     if ids.len() + 1 > w.config.n_ctx {
         return Err(format!("the prompt needs at most {} tokens", w.config.n_ctx - 1).into());
@@ -405,17 +427,10 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let gpu = Gpu::new()?;
     let gw = GpuWeights::upload(&gpu, &w)?;
     let mut cache = KvCache::new(&gpu, &w.config);
-    let argmax = |l: &[f32]| -> ember::Result<u32> {
-        cpu::argmax(l)
-            .map(|i| i as u32)
-            .ok_or_else(|| ember::Error::Input("logits contain NaN".into()))
-    };
+    let argmax = gpt2::argmax_token;
     println!(
-        "{} ({:?}), {} {}; timestamp tick {} ns",
-        gpu.info.name,
-        gpu.info.backend,
-        gpu.info.driver,
-        gpu.info.driver_info,
+        "{}; timestamp tick {} ns",
+        device(&gpu),
         gpu.queue.get_timestamp_period()
     );
     println!(
@@ -441,7 +456,7 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     print_table(&format!("decode step at position {}", ids.len()), &decode);
 
     // Context sweep (D40): fill the cache to position p once, then time one decode step there,
-    // rewinding the cache to p before each run.
+    // rewinding the cache to p at the start of each run (a length reset, no GPU work).
     println!("\ndecode vs context position");
     println!(
         "  {:>8} {:>10} {:>10} {:>12} {:>8}",
@@ -454,14 +469,10 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         cache.clear();
         let next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &filler[..pos])?)?;
-        let mut samples = Vec::new();
-        for run in 0..=runs {
+        let samples = sample_runs(&gpu, runs, || {
             cache.truncate(pos)?;
-            let (_, s) = measure(&gpu, || gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next]))?;
-            if run > 0 {
-                samples.push(s);
-            }
-        }
+            gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next])
+        })?;
         let (gpu_ms, wall_ms) = step_ms(&samples);
         let attn = kernel_ms(&samples, "attention");
         println!(
@@ -471,20 +482,13 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Bandwidth roofline (D41): a 256 MiB copy kernel reads and writes every byte once.
-    let n = 64 << 20;
-    let src = gpu.upload(&Tensor::new(&[n], (0..n).map(|i| i as f32).collect())?);
-    let mut copies = Vec::new();
-    for run in 0..=runs {
-        let (out, s) = measure(&gpu, || ops::copy(&gpu, &src))?;
-        drop(out);
-        if run > 0 {
-            copies.push(s);
-        }
-    }
-    let copy_ms = kernel_ms(&copies, "copy");
-    let copy_gbs = 2.0 * (n * 4) as f64 / (copy_ms * 1e6);
+    let src = probe_buffer(&gpu)?;
+    let copy_ms = gpu_ms(&gpu, runs, || ops::copy(&gpu, &src))?;
+    let copy_gbs = giga_per_s(2.0 * (PROBE_LEN * 4) as f64, copy_ms);
     let (decode_gpu_ms, decode_wall_ms) = step_ms(&decode);
-    let bytes = decode_weight_bytes(&w);
+    // Bytes of weights a decode step reads: every tensor once, except `wpe`, of which it reads
+    // one row. (`wte` is read whole by the tied LM head.)
+    let bytes = 4.0 * (w.param_count() - w.wpe.len()) as f64;
     println!("\nbandwidth");
     println!(
         "  copy kernel     256 MiB read + 256 MiB written in {copy_ms:.3} ms = {copy_gbs:.1} GB/s (measured roofline)"
@@ -493,7 +497,7 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("decode kernels", decode_gpu_ms),
         ("decode wall", decode_wall_ms),
     ] {
-        let gbs = bytes / (ms * 1e6);
+        let gbs = giga_per_s(bytes, ms);
         println!(
             "  {what:<16}{:.0} MB of weights in {ms:.3} ms = {gbs:.1} GB/s = {:.0}% of the roofline",
             bytes / 1e6,
@@ -503,49 +507,39 @@ fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A probe buffer of `PROBE_LEN` distinct values.
+fn probe_buffer(gpu: &Gpu) -> CliResult<GpuTensor> {
+    let data = (0..PROBE_LEN).map(|i| i as f32).collect();
+    Ok(gpu.upload(&Tensor::new(&[PROBE_LEN], data)?))
+}
+
 /// `ember matmul [-n RUNS]` (D47): GPU time of each linear kernel on GPT-2's shapes, median of
 /// RUNS (default 5) after 1 warm-up. Prefill shapes report GFLOP/s against a measured compute
 /// roof (`fma_peak`); one-row shapes report weight GB/s against the copy roofline (D41). Random
 /// weights: no checkpoint needed.
-fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let runs = match args {
-        [] => 5,
-        [flag, v] if flag == "-n" => v.parse().map_err(|_| format!("-n: `{v}` is not a count"))?,
-        _ => return Err(format!("bad arguments\n\n{USAGE}").into()),
-    };
-    if runs == 0 {
-        return Err("-n: at least one measured run".into());
+fn matmul_cmd(args: &[String]) -> CliResult {
+    let Opts { n, prompt, .. } = parse_opts(args, 5, &[])?;
+    if !prompt.is_empty() {
+        return Err(format!("matmul takes no prompt\n\n{USAGE}").into());
     }
+    let runs = measured_runs(n)?;
     let gpu = Gpu::new()?;
     println!(
-        "{} ({:?}), {} {}; median of {runs} after 1 warm-up; GPU time from timestamp queries",
-        gpu.info.name, gpu.info.backend, gpu.info.driver, gpu.info.driver_info
+        "{}; median of {runs} after 1 warm-up; GPU time from timestamp queries",
+        device(&gpu)
     );
-    // Median GPU ms of the kernels one call of `op` dispatches.
-    let time = |op: &dyn Fn() -> ember::Result<ember::GpuTensor>| -> Result<f64, Box<dyn std::error::Error>> {
-        let mut samples = Vec::new();
-        for run in 0..=runs {
-            let (out, s) = measure(&gpu, op)?;
-            drop(out);
-            if run > 0 {
-                samples.push(s);
-            }
-        }
-        Ok(step_ms(&samples).0)
-    };
+    let time = |op: &dyn Fn() -> ember::Result<GpuTensor>| gpu_ms(&gpu, runs, op);
 
     // Compute roof: 4096 x 256 invocations, 32 chains x 2048 steps each = 137 GFLOP.
     let (groups, iters) = (4096u32, 2048u32);
     let peak_ms = time(&|| ops::fma_peak(&gpu, groups, iters))?;
     let peak_flops = 2.0 * (ops::FMA_PEAK_CHAINS * iters as usize * 256 * groups as usize) as f64;
-    let peak = peak_flops / (peak_ms * 1e6);
-    // Bandwidth roof (D41).
-    let n = 64 << 20;
-    let src = gpu.upload(&Tensor::new(&[n], vec![1.0; n])?);
-    let copy_ms = time(&|| ops::copy(&gpu, &src))?;
-    let copy_gbs = 2.0 * (n * 4) as f64 / (copy_ms * 1e6);
-    let read_ms = time(&|| ops::read_peak(&gpu, &src))?;
-    let read_gbs = (n * 4) as f64 / (read_ms * 1e6);
+    let peak = giga_per_s(peak_flops, peak_ms);
+    // Bandwidth roofs (D41, D47).
+    let src = probe_buffer(&gpu)?;
+    let probe_bytes = (PROBE_LEN * 4) as f64;
+    let copy_gbs = giga_per_s(2.0 * probe_bytes, time(&|| ops::copy(&gpu, &src))?);
+    let read_gbs = giga_per_s(probe_bytes, time(&|| ops::read_peak(&gpu, &src))?);
     drop(src);
     println!("compute roof (fma_peak)  {peak:7.1} GFLOP/s");
     println!("copy (D41)               {copy_gbs:7.1} GB/s read + written");
@@ -560,7 +554,7 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("lm_head", 768, 50257),
     ];
     let mut rng = Rng::new(1);
-    let mut random = |shape: &[usize]| -> Result<ember::GpuTensor, Box<dyn std::error::Error>> {
+    let mut random = |shape: &[usize]| -> CliResult<GpuTensor> {
         let n = shape.iter().product();
         Ok(gpu.upload(&Tensor::new(shape, rng.vec(n, -0.1, 0.1))?))
     };
@@ -581,7 +575,7 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let flops = 2.0 * (t * n_in * n_out) as f64;
             let naive = time(&|| ops::linear_naive(&gpu, &x, &w_out_in, None))?;
             let tiled = time(&|| ops::linear(&gpu, &x, &w_in_out, None))?;
-            let gf = |ms: f64| flops / (ms * 1e6);
+            let gf = |ms: f64| giga_per_s(flops, ms);
             println!(
                 "  {name:<9} {t:>5} {:>8.1} ({:>4.1}%) {:>8.1} ({:>4.1}%) {:>7.1}x",
                 gf(naive),
@@ -611,7 +605,7 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let xs = [random(&[1, 768])?, random(&[1, 3072])?];
     let x_for = |n_in: usize| if n_in == 768 { &xs[0] } else { &xs[1] };
     // Median per-kind ms of a whole step, for one kernel and weight layout.
-    let mut step = |naive: bool| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    let mut step = |naive: bool| -> CliResult<Vec<f64>> {
         let ws = order
             .iter()
             .map(|&m| {
@@ -619,27 +613,25 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 random(&if naive { [n_out, n_in] } else { [n_in, n_out] })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let samples = sample_runs(&gpu, runs, || {
+            for (&m, w) in order.iter().zip(&ws) {
+                let x = x_for(mats[m].1);
+                if naive {
+                    ops::linear_naive(&gpu, x, w, None)?;
+                } else {
+                    ops::linear(&gpu, x, w, None)?;
+                }
+            }
+            Ok(())
+        })?;
         let mut per_kind: Vec<Vec<f64>> = vec![Vec::new(); mats.len()];
-        for run in 0..=runs {
-            let ((), s) = measure(&gpu, || {
-                for (&m, w) in order.iter().zip(&ws) {
-                    let x = x_for(mats[m].1);
-                    if naive {
-                        ops::linear_naive(&gpu, x, w, None)?;
-                    } else {
-                        ops::linear(&gpu, x, w, None)?;
-                    }
-                }
-                Ok(())
-            })?;
-            if run > 0 {
-                let mut sums = vec![0.0; mats.len()];
-                for (&m, k) in order.iter().zip(&s.kernels) {
-                    sums[m] += k.ns / 1e6;
-                }
-                for (v, x) in per_kind.iter_mut().zip(sums) {
-                    v.push(x);
-                }
+        for s in &samples {
+            let mut sums = vec![0.0; mats.len()];
+            for (&m, k) in order.iter().zip(&s.kernels) {
+                sums[m] += k.ns / 1e6;
+            }
+            for (v, x) in per_kind.iter_mut().zip(sums) {
+                v.push(x);
             }
         }
         Ok(per_kind.into_iter().map(median).collect())
@@ -650,7 +642,7 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     for (m, &(name, n_in, n_out)) in mats.iter().enumerate() {
         let reps = if name == "lm_head" { 1 } else { n_layer };
         let bytes = 4.0 * (reps * n_in * n_out) as f64;
-        let gbs = |ms: f64| bytes / (ms * 1e6);
+        let gbs = |ms: f64| giga_per_s(bytes, ms);
         naive_total += naive[m];
         matvec_total += matvec[m];
         bytes_total += bytes;
@@ -667,10 +659,10 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  step      {:>9.1} {:>8.1} ({:>4.0}%) {:>8.1} ({:>4.0}%) {:>7.1}x   ({naive_total:.2} ms vs {matvec_total:.2} ms)",
         bytes_total / 1e6,
-        bytes_total / (naive_total * 1e6),
-        100.0 * bytes_total / (naive_total * 1e6) / read_gbs,
-        bytes_total / (matvec_total * 1e6),
-        100.0 * bytes_total / (matvec_total * 1e6) / read_gbs,
+        giga_per_s(bytes_total, naive_total),
+        100.0 * giga_per_s(bytes_total, naive_total) / read_gbs,
+        giga_per_s(bytes_total, matvec_total),
+        100.0 * giga_per_s(bytes_total, matvec_total) / read_gbs,
         naive_total / matvec_total
     );
     Ok(())
@@ -696,7 +688,7 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_opts, take_utf8};
+    use super::{parse_opts, prompt_opts, take_utf8};
 
     fn args(s: &str) -> Vec<String> {
         s.split(' ')
@@ -707,7 +699,7 @@ mod tests {
 
     #[test]
     fn options_come_before_the_prompt_in_any_order() {
-        let o = parse_opts(
+        let o = prompt_opts(
             &args("-n 5 --cpu hello world"),
             20,
             &["--cpu", "--no-cache"],
@@ -729,10 +721,13 @@ mod tests {
     fn bad_options_are_errors_not_prompts() {
         let flags = ["--cpu", "--no-cache"];
         for bad in ["", "-n 5", "-n", "-n five hi", "--cpu", "--fast hi"] {
-            assert!(parse_opts(&args(bad), 20, &flags).is_err(), "`{bad}`");
+            assert!(prompt_opts(&args(bad), 20, &flags).is_err(), "`{bad}`");
         }
         // bench takes no flags: `--cpu` there is unknown.
-        assert!(parse_opts(&args("--cpu hi"), 32, &[]).is_err());
+        assert!(prompt_opts(&args("--cpu hi"), 32, &[]).is_err());
+        // matmul takes options but no prompt.
+        let o = parse_opts(&args("-n 3"), 5, &[]).unwrap();
+        assert_eq!((o.n, o.prompt.as_str()), (3, ""));
     }
 
     #[test]

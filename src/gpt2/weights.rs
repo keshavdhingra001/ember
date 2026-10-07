@@ -119,6 +119,24 @@ impl Weights {
         })
     }
 
+    /// Learned parameters: every tensor's elements. (GPT-2 124M: 124,439,808.)
+    pub fn param_count(&self) -> usize {
+        let norm = |n: &Norm| n.gain.len() + n.bias.len();
+        let lin = |l: &Linear| l.w.len() + l.b.len();
+        let block = |b: &Block| {
+            norm(&b.ln_1)
+                + lin(&b.qkv)
+                + lin(&b.attn_out)
+                + norm(&b.ln_2)
+                + lin(&b.fc)
+                + lin(&b.fc_out)
+        };
+        self.wte.len()
+            + self.wpe.len()
+            + self.blocks.iter().map(block).sum::<usize>()
+            + norm(&self.ln_f)
+    }
+
     /// A model with seeded random weights, for tests that don't need the real checkpoint (D15).
     /// Scales keep activations O(1) and attention far from uniform, so bugs show up as big
     /// differences instead of hiding in noise.
@@ -269,5 +287,16 @@ mod tests {
         let a = Weights::random(config(), 1);
         assert_eq!(a.wte, Weights::random(config(), 1).wte);
         assert_ne!(a.wte, Weights::random(config(), 2).wte);
+    }
+
+    #[test]
+    fn param_count_counts_every_tensor() {
+        // wte 5x2 + wpe 3x2, one block (2 norms of 2+2; qkv 2x6+6, attn_out 2x2+2, fc 2x8+8,
+        // fc_out 8x2+2), ln_f 2+2.
+        let block = 4 + 18 + 6 + 4 + 24 + 18;
+        assert_eq!(
+            Weights::random(config(), 1).param_count(),
+            10 + 6 + block + 4
+        );
     }
 }

@@ -15,7 +15,7 @@ pub const ELEMENTWISE_WG: u32 = 256;
 
 /// Elementwise `a + b` on the GPU.
 pub fn add(gpu: &Gpu, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor> {
-    add_with_max_groups(gpu, a, b, gpu.limits.max_compute_workgroups_per_dimension)
+    add_with_max_groups(gpu, a, b, gpu.max_groups())
 }
 
 /// `add` with a cap on the workgroup count. Tests pass a tiny cap to exercise the
@@ -85,7 +85,7 @@ pub fn gelu(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
         &gpu.kernels.gelu,
         &[&x.buffer, &out.buffer],
         Params4::new(len_u32(x.len())?, 0, 0, 0),
-        gpu.limits.max_compute_workgroups_per_dimension,
+        gpu.max_groups(),
     );
     Ok(out)
 }
@@ -119,7 +119,7 @@ pub fn embed(
         &gpu.kernels.embed,
         &[&wte_t.buffer, &wpe.buffer, &ids_buf, &out.buffer],
         Params4::new(n, e as u32, start as u32, len_u32(v)?),
-        gpu.limits.max_compute_workgroups_per_dimension,
+        gpu.max_groups(),
     );
     Ok(out)
 }
@@ -129,7 +129,7 @@ fn rows_cols(gpu: &Gpu, op: &str, x: &GpuTensor) -> Result<(u32, u32)> {
     let &[rows, cols] = x.shape() else {
         return Err(Error::Shape(format!("{op}: x {:?} must be 2-D", x.shape())));
     };
-    if rows > gpu.limits.max_compute_workgroups_per_dimension as usize {
+    if rows > gpu.max_groups() as usize {
         return Err(Error::Shape(format!(
             "{op}: {rows} rows exceed one dispatch dimension"
         )));
@@ -259,7 +259,7 @@ fn linear_dispatch(
     }
     len_u32(t * n_in.max(n_out))?;
     len_u32(n_out * n_in)?;
-    let max = gpu.limits.max_compute_workgroups_per_dimension as usize;
+    let max = gpu.max_groups() as usize;
     if gx > max || gy > max {
         return Err(Error::Shape(format!(
             "linear: [{t}, {n_out}] output needs more than {max} workgroups per dimension"
@@ -349,7 +349,7 @@ pub fn kv_write(
         &gpu.kernels.kv_write,
         &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer],
         Params4::new((t * e) as u32, e as u32, start as u32, 0),
-        gpu.limits.max_compute_workgroups_per_dimension,
+        gpu.max_groups(),
     );
     Ok(())
 }
@@ -372,7 +372,7 @@ pub fn attention_cached(
             start + t
         )));
     }
-    if n_head > gpu.limits.max_compute_workgroups_per_dimension as usize {
+    if n_head > gpu.max_groups() as usize {
         return Err(Error::Shape(format!(
             "attention: {n_head} heads exceed one dispatch dimension"
         )));
@@ -417,7 +417,7 @@ pub fn causal_attention(gpu: &Gpu, qkv: &GpuTensor, n_head: usize) -> Result<Gpu
 /// length must be a multiple of 4 (whole vec4s). For moving data, `Gpu::copy` / `row` are the
 /// tools; this exists to be timed.
 pub fn copy(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
-    copy_with_max_groups(gpu, x, gpu.limits.max_compute_workgroups_per_dimension)
+    copy_with_max_groups(gpu, x, gpu.max_groups())
 }
 
 /// `copy` with a cap on the workgroup count, so tests can exercise the grid-stride loop (as
@@ -452,7 +452,7 @@ pub const FMA_PEAK_CHAINS: usize = 32;
 /// work can't be optimised away. Like `copy`, it exists to be timed.
 pub fn fma_peak(gpu: &Gpu, groups: u32, iters: u32) -> Result<GpuTensor> {
     let n = groups as usize * ELEMENTWISE_WG as usize;
-    if groups == 0 || groups > gpu.limits.max_compute_workgroups_per_dimension {
+    if groups == 0 || groups > gpu.max_groups() {
         return Err(Error::Shape(format!("fma_peak: {groups} workgroups")));
     }
     let out = gpu.alloc(&[n]);

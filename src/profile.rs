@@ -4,6 +4,7 @@
 //! it (D4): it reads the GPU's clock, never the CPU's, and only for the report.
 
 use crate::error::{Error, Result};
+use crate::gpu::map_read;
 
 /// Dispatches one profiling window can hold: WebGPU caps a query set at 4096 queries, two per
 /// dispatch. A GPT-2 124M step is 135 dispatches.
@@ -96,25 +97,7 @@ impl Profiler {
         enc.copy_buffer_to_buffer(&self.resolve, 0, &self.staging, 0, bytes);
         queue.submit([enc.finish()]);
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.staging
-            .map_async(wgpu::MapMode::Read, ..bytes, move |r| {
-                let _ = tx.send(r);
-            });
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| Error::Readback(e.to_string()))?;
-        rx.recv()
-            .map_err(|e| Error::Readback(e.to_string()))?
-            .map_err(|e| Error::Readback(e.to_string()))?;
-        let ticks: Vec<u64> = {
-            let view = self
-                .staging
-                .get_mapped_range(..bytes)
-                .map_err(|e| Error::Readback(e.to_string()))?;
-            bytemuck::cast_slice::<u8, u64>(&view).to_vec()
-        };
-        self.staging.unmap();
+        let ticks: Vec<u64> = map_read(device, &self.staging, bytes)?;
 
         let period = queue.get_timestamp_period() as f64;
         let times = self

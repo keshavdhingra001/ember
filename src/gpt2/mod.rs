@@ -7,5 +7,5 @@ pub mod gpu;
 mod weights;
 
 pub use config::Config;
-pub use forward::{forward, generate_greedy, hidden, next_logits};
+pub use forward::{argmax_token, forward, generate_greedy, hidden, next_logits};
 pub use weights::{Block, Linear, Norm, Weights};

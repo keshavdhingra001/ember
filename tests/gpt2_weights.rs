@@ -33,4 +33,5 @@ fn loads_gpt2_small() {
         .map(|n| st.entry(n).unwrap().shape.iter().product::<usize>())
         .sum();
     assert_eq!(params, 124_439_808);
+    assert_eq!(w.param_count(), params);
 }
