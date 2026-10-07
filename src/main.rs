@@ -363,12 +363,12 @@ fn giga_per_s(x: f64, ms: f64) -> f64 {
     x / (ms * 1e6)
 }
 
-/// Median per-step GPU ms of one kernel across samples (0 if it never ran).
-fn kernel_ms(samples: &[Sample], kernel: &str) -> f64 {
+/// Median per-step GPU ms of the named kernels together across samples (0 if none ran).
+fn kernel_ms(samples: &[Sample], kernels: &[&str]) -> f64 {
     let per_run = samples.iter().map(|s| {
         s.kernels
             .iter()
-            .filter(|t| t.kernel == kernel)
+            .filter(|t| kernels.contains(&t.kernel))
             .map(|t| t.ns)
             .sum::<f64>()
     });
@@ -392,7 +392,7 @@ fn print_table(title: &str, samples: &[Sample]) {
     );
     let mut rows: Vec<(&str, usize, f64)> = profile::by_kernel(&samples[0].kernels)
         .into_iter()
-        .map(|(k, calls, _)| (k, calls, kernel_ms(samples, k)))
+        .map(|(k, calls, _)| (k, calls, kernel_ms(samples, &[k])))
         .collect();
     rows.sort_by(|a, b| b.2.total_cmp(&a.2));
     let calls: usize = rows.iter().map(|r| r.1).sum();
@@ -474,7 +474,8 @@ fn profile_cmd(args: &[String]) -> CliResult {
             gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next])
         })?;
         let (gpu_ms, wall_ms) = step_ms(&samples);
-        let attn = kernel_ms(&samples, "attention");
+        // Both passes of D63.
+        let attn = kernel_ms(&samples, &["attention", "attention_combine"]);
         println!(
             "  {pos:>8} {wall_ms:>10.3} {gpu_ms:>10.3} {attn:>12.3} {:>7.1}%",
             100.0 * attn / gpu_ms
