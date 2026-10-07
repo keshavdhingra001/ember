@@ -18,10 +18,11 @@ CPU reference forward pass (plain Rust f32) ──┘  oracle: every kernel and 
                                                  differential-tested against it (D3, D5)
 ```
 
-Today (M4, Tier 1 done): GPT-2 124M runs end to end on the GPU with naive kernels and a KV
-cache, matching the CPU reference (itself checked against float64 numpy). Not yet built: the
-per-token command encoder and buffer reuse (M7; today every op submits its own dispatch and
-allocates its output), f16 / quantized weights (M9), and the sampler beyond greedy.
+Today (M6): GPT-2 124M runs end to end on the GPU with a KV cache, a tiled matmul for prefill
+and a matrix-vector kernel for decode, matching the CPU reference (itself checked against
+float64 numpy). Not yet built: the per-token command encoder and buffer reuse (M7; today every
+op submits its own dispatch and allocates its output), f16 / quantized weights (M9), and the
+sampler beyond greedy.
 
 ## Decisions
 
@@ -505,10 +506,18 @@ the baseline (D49).
   threads, and each loaded register value by 4 multiply-adds, which turns a memory-bound loop
   into a compute-bound one. The strided 4×4 assignment, instead of a contiguous 4×4 block, makes
   the inner loop's shared-memory reads and the final stores land on consecutive addresses.
+- **Registers are four named `vec4`s, not arrays.** The first version kept the 4×4 block in
+  `array<array<f32, 4>, 4>`, and its loaded values in two `array<f32, 4>`. Mesa didn't keep
+  those loop-indexed private arrays in registers. The kernel ran at 113 GFLOP/s, and the
+  compute probe written the same way measured the same 116 GFLOP/s, so it looked like a
+  kernel at 97% of its roof. Rewriting the probe with plain variables gave 1431 GFLOP/s
+  (D47). With `acc0..acc3: vec4` (lane c = column `tx + 16c`) and shared memory packed so
+  that one vec4 load gives a thread its 4 values for one k, the matmul went from 113 to
+  455 GFLOP/s. Each output still runs the same serial fma sequence (D46).
 - **Global loads are scalar, not vec4** (the M6 table recommended vec4). GPT-2's LM head has
   50257 columns, so `w` rows aren't 16-byte aligned. Consecutive threads read consecutive
-  scalars, which the hardware coalesces anyway. The tile sweep (D48) measured whether vec4 would
-  pay.
+  scalars, which the hardware coalesces anyway. Whether vec4 loads would pay where the
+  shapes allow them is **not measured** yet.
 
 ### D44: Decode (T = 1) gets a matrix-vector kernel
 - **What:** `ops::linear` dispatches `matvec.wgsl` when `T = 1`, and `matmul` otherwise. The
@@ -546,6 +555,9 @@ the baseline (D49).
   WGSL lets an implementation evaluate `fma` as a fused or an unfused multiply-add, so equal bits
   across kernels are a property this driver is *tested* for, not one the language guarantees.
   If a driver breaks it, the test says so.
+- **Padding the last K step would not change any bits.** A padded step adds `fma(0, 0, acc)`,
+  and `acc + 0 = acc` for every acc the kernel can hold (acc starts at +0, and a sum that
+  rounds to zero is +0). So stopping at n_in only saves work. Mutation check: D50.
 - **Revisit if:** the matvec is under ~70% of the bandwidth roofline. Only `n_out` threads run
   (768 for `attn_out` and `fc_out`), which may be too few to hide memory latency. The fix would
   be split-K with a fixed combine order, and the tiled kernel would combine in the same order.
@@ -563,7 +575,95 @@ the baseline (D49).
 - **What:** a few configurations were measured with `ember matmul` and the best is compiled
   in. No runtime autotuning.
 - **Why:** one target GPU for now; autotuning is machinery without a second device to justify it.
+- **Matvec sweep (2026-10-07):** workgroup size × weight loads in flight per thread (a
+  "lookahead": issue 8 loads, then their 8 fmas, in k order, so D46 holds). One decode step's
+  matrices, ms of GPU time (`ember matmul`, decode table):
+
+  | Workgroup | Loads in flight | Step ms | LM head GB/s | `fc_out` GB/s |
+  |---|---|---|---|---|
+  | 64 | 1 | 42.2 | 26.4 | 5.8 |
+  | 64 | 4 | 29.0 | 16.5 | 12.0 |
+  | 64 | 8 | 27.2 | 16.3 | 13.9 |
+  | 256 | 1 | 38.9 | 30.3 | 6.4 |
+  | 256 | 4 | 28.3 | 16.1 | 12.7 |
+  | 256 | 8 | 25.7 | 16.5 | 15.5 |
+
+  No single configuration wins everywhere. The narrow matrices (768–3072 outputs, so 768–3072
+  threads) need several loads in flight per thread to hide memory latency. The LM head (50257
+  outputs) has enough threads without them and loses 45% with them; the likely cause is the
+  extra registers lowering occupancy (not verified). So the matvec is compiled twice from one
+  source with an `override LOOKAHEAD: bool`: workgroup 256, lookahead below 16384 outputs, none
+  from there on (`matvec_wide`). The 16384 boundary sits between the two measured sizes; it is
+  not itself measured. Result: 22.2 ms per step's matrices, against 25.7 for the best single
+  configuration.
+- **Not swept:** the matmul's tile sizes (64×64×16, 4×4 per thread) and vec4 global loads.
 
 ### D49: The naive kernel stays, as `linear_naive`
 - **Why:** it's the benchmark's baseline, and an independent implementation to compare the
   tiled kernels with bit for bit (D46).
+
+### D50: M6 results
+`ember matmul` (2026-10-07, Iris Xe / Vulkan / Mesa 26.2.2, GPU time from timestamp queries,
+median of 5 after 1 warm-up, random weights):
+
+- **Roofs.** Compute: **1431 GFLOP/s** (`fma_peak`, 32 independent fma chains per invocation).
+  Read bandwidth: **29.6 GB/s** (`read_peak`, a 256 MiB stream of vec4 reads). Copy: 25.3 GB/s
+  read + written (D41). A read-only stream beats copy's reads + writes, so decode, which only
+  reads weights, is measured against the read roof.
+- **Compute probe pitfalls.** Written with an array of chains, the probe measured 116 GFLOP/s
+  (the D43 register problem). Per invocation: 8 scalar chains 900, 4 vec4s 1177, 8 vec4s 1431,
+  16 vec4s 489 (out of registers).
+- **Prefill (tiled vs naive), GFLOP/s:**
+
+  | Matrix (in → out) | T = 7 | T = 128 | T = 512 |
+  |---|---|---|---|
+  | qkv (768 → 2304) | 7.8 → 26.6 | 12.3 → 340 | 11.9 → 457 (32% of roof) |
+  | attn_out (768 → 768) | 8.5 → 17.8 | 11.9 → 238 | 12.3 → 405 |
+  | fc (768 → 3072) | 10.5 → 35.2 | 12.2 → 376 | 12.1 → 466 |
+  | fc_out (3072 → 768) | 8.5 → 17.8 | 10.4 → 281 | 10.5 → 411 |
+  | lm_head (768 → 50257) | 12.7 → 46.7 | | |
+
+  25–39× at T ≥ 128. At T = 7 only 2–4×: a 7-row batch uses 7 of each 64-row tile, and
+  with one tile row there are only `n_out / 64` workgroups (12 for a 768-output matrix), so
+  the GPU is mostly idle.
+- **Decode (one step's matrices, 12 distinct copies of each block matrix plus the head, in
+  model order):** naive 34.3 ms → matvec 22.8 ms; **21.7 GB/s = 73% of the read roof** (49%
+  naive). Per matrix: qkv 86%, fc 93%, LM head 92%, but attn_out and fc_out (768 outputs)
+  only 49–50%: 768 threads can't keep enough reads in flight. An earlier version timed one
+  matrix over and over, which kept it in the last-level cache (shared with the CPU) and
+  reported up to 187% of the bandwidth roof.
+
+Model level: `ember profile` and `ember bench -n 32` on the 7-token prompt, the pre-M6 binary
+(`ca030de`) and M6 run back to back on an idle machine:
+
+| | Before | After | |
+|---|---|---|---|
+| Prefill, kernels | 123.3 ms | 52.2 ms | 2.4× |
+| Prefill, wall | 129.5 ms | 58.3 ms | 2.2× |
+| Decode step, kernels | 35.9 ms | 23.5 ms | 1.53× |
+| Decode step, wall | 41.5 ms | 28.5 ms | 1.46× |
+| Decode, `ember bench` | 25.3 tokens/s | **35.8 tokens/s** | 1.42× |
+| No KV cache, `ember bench` | 2.81 tokens/s | 16.9 tokens/s | 6.0× |
+| Decode weight bandwidth, kernels | 13.8 GB/s | 21.1 GB/s (71% of the read roof) | |
+
+- The decode wall clock now has ~5 ms outside kernels out of 28.5 (submits, per-op buffers,
+  readback): M7's target. Attention reaches 30% of GPU time at position 1000 (21% before),
+  because everything else got faster.
+- The 7-token prefill's matmuls take 46 ms, almost 3 decode steps for 7 rows. They should
+  cost about one weight read (~17 ms) since the batch is far too small to be compute-bound.
+  That's the same parallelism problem as the narrow matvecs (D46).
+- `embed` went from 0.006 to 0.07 ms in the prefill (strided reads of `wte_t`, D45):
+  negligible, as expected.
+- The before numbers differ by a few % from D42's (same binary, another day). The gains above
+  compare runs taken minutes apart.
+- **Mutation pass (27 mutants in matmul, matvec, embed and the weight upload; `--test gpu_ops
+  --test gpt2_gpu`): 24 caught.** All four barrier removals were caught, unlike M2's (D18):
+  a 64×64 tile spans many SIMD groups, so the race window opens. A swapped pair of fmas in
+  the matvec's lookahead (same numbers, a different summation order) is caught only by the
+  bitwise tests (D46), not by the tolerance against the CPU. The 3 survivors:
+  - matmul running padded K steps: equivalent, as D46 predicts.
+  - matvec's lookahead bound `k + 8 <= steps` → `<`: the last 8 values move to the plain loop,
+    in the same order. Equivalent.
+  - matmul writing row `t` (one past the end): this driver drops out-of-bounds writes. WebGPU
+    also allows them to land elsewhere in the same buffer, so the check stays (like D22's gelu
+    clamp).

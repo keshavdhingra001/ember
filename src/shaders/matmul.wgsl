@@ -36,7 +36,9 @@ const THREADS: u32 = TS * TS;
 var<workgroup> xs: array<array<vec4<f32>, TS>, BK>;
 var<workgroup> ws: array<array<vec4<f32>, TS>, BK>;
 
-// Row `i` of out, columns o, o + 16, o + 32, o + 48, from one accumulator.
+// Row `i` of out, columns o, o + 16, o + 32, o + 48, from one accumulator. The bounds checks
+// must stay even though dropping the row check passes every test here (D50): WebGPU lets an
+// out-of-bounds write land anywhere in the same buffer, and this driver happens to drop it.
 fn store_row(i: u32, o: u32, acc: vec4<f32>) {
     if (i >= params.t) {
         return;
@@ -102,8 +104,8 @@ fn main(
         // The stores above must land before any thread reads the slices.
         workgroupBarrier();
 
-        // Only the k values that exist: a padded step would add x * 0 to acc, which is not the
-        // matvec's sequence (D46).
+        // Only the k values that exist. A padded step would add fma(0, 0, acc) = acc, so the bits
+        // wouldn't change (D46); stopping here just skips the work.
         let steps = min(BK, params.n_in - k0);
         for (var k = 0u; k < steps; k++) {
             let a = xs[k][ty];
