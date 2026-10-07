@@ -197,9 +197,8 @@ fn layer_norm_matches_cpu() {
 
 // ------------------------------------------------------------------ linear
 
-/// Same summation order as the CPU, so the nonzero error (measured worst 2.9e-6 at n_in = 3072)
-/// is fused multiply-add: the GPU rounds `acc + x * w` once, the CPU twice. The same for all three
-/// kernels: each sums k = 0, 1, ... serially (D46).
+/// The GPU rounds `acc + x * w` once (fused), the CPU twice, and `linear` sums in chunks of 256
+/// (D51) while the CPU and `linear_naive` sum serially (D53, D54). Measured worst: see D54.
 const LINEAR_TOL: Tol = Tol {
     abs: 1e-5,
     rel: 1e-5,
@@ -284,16 +283,17 @@ fn linear_naive_matches_cpu() {
 }
 
 /// D46: a row computed alone (matvec) has the same bits as that row inside a batch (tiled
-/// matmul), and as the naive kernel's: all three run the same fused multiply-adds in the same
-/// order. The decode-equals-recompute check (D33) depends on it.
+/// matmul): both run the same chunked sum (D51). The decode-equals-recompute check (D33) depends
+/// on it. The naive kernel sums serially, so it isn't part of this (D53).
 #[test]
-fn every_linear_kernel_gives_a_row_the_same_bits() {
+fn matmul_and_matvec_give_a_row_the_same_bits() {
     let g = gpu();
-    let bits = |t: &Tensor| t.data().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    // 777 = 3 matvec chunks of 256 and 9 left over (one past the 8-load lookahead); 16384
-    // outputs run the matvec without lookahead (D48).
+    // 777 = 3 chunks of 256 and 9 left over (one past the 8-load lookahead); 1300 = 5 chunks and
+    // a partial one, so two matvec rounds, the second with 2 of its 4 slices empty; 3072 = 3
+    // full rounds; 16384 outputs run the matvec without lookahead (D48).
     for (seed, (t, n_in, n_out)) in [
         (70, 777, 130),
+        (3, 1300, 70),
         (5, 3072, 768),
         (3, 768, 2304),
         (2, 100, 16384),
@@ -307,14 +307,6 @@ fn every_linear_kernel_gives_a_row_the_same_bits() {
         let batch = g
             .read(&ops::linear(g, &gx, &gw, Some(&gb)).unwrap())
             .unwrap();
-        let naive = g
-            .read(&ops::linear_naive(g, &gx, &g.upload(&w), Some(&gb)).unwrap())
-            .unwrap();
-        assert_eq!(
-            bits(&naive),
-            bits(&batch),
-            "({t}, {n_in}, {n_out}) naive vs tiled"
-        );
         for i in [0, t / 2, t - 1] {
             let row = g.upload(&rows(&x, i, i + 1));
             let alone = g
@@ -326,6 +318,62 @@ fn every_linear_kernel_gives_a_row_the_same_bits() {
                 "({t}, {n_in}, {n_out}) row {i}"
             );
         }
+    }
+}
+
+fn bits(t: &Tensor) -> Vec<u32> {
+    t.data().iter().map(|x| x.to_bits()).collect()
+}
+
+/// D51 written out on the CPU with `f32::mul_add` (one rounding, like a fused `fma`): chunks of
+/// 256 summed serially from 0, chunk partials added in order from 0, then the bias.
+fn chunked_linear(x: &Tensor, w: &Tensor, b: &Tensor) -> Tensor {
+    let (&[t, n_in], &[n_out, _]) = (x.shape(), w.shape()) else {
+        panic!("2-D");
+    };
+    let mut out = Vec::with_capacity(t * n_out);
+    for i in 0..t {
+        let xr = &x.data()[i * n_in..(i + 1) * n_in];
+        for o in 0..n_out {
+            let wr = &w.data()[o * n_in..(o + 1) * n_in];
+            let mut total = 0.0f32;
+            for (xc, wc) in xr.chunks(256).zip(wr.chunks(256)) {
+                total += xc.iter().zip(wc).fold(0.0f32, |p, (a, b)| a.mul_add(*b, p));
+            }
+            out.push(total + b.data()[o]);
+        }
+    }
+    Tensor::new(&[t, n_out], out).unwrap()
+}
+
+/// Both kernels compute exactly D51's order, not just some order they share: a wrong chunk size
+/// in both would pass the test above and the CPU tolerance. Like D46's check this holds because
+/// this driver fuses `fma()`, which WGSL allows but doesn't require; if a driver doesn't, this
+/// test says so.
+#[test]
+fn linear_is_bitwise_the_chunked_sum() {
+    let g = gpu();
+    for (seed, (t, n_in, n_out)) in [(1, 1300, 70), (3, 1300, 70), (1, 3072, 130), (70, 255, 65)]
+        .into_iter()
+        .enumerate()
+    {
+        let (x, w, b) = linear_case(t, n_in, n_out, 80 + seed as u64);
+        let got = g
+            .read(
+                &ops::linear(
+                    g,
+                    &g.upload(&x),
+                    &g.upload(&cpu::transpose(&w).unwrap()),
+                    Some(&g.upload(&b)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            bits(&got),
+            bits(&chunked_linear(&x, &w, &b)),
+            "({t}, {n_in}, {n_out})"
+        );
     }
 }
 

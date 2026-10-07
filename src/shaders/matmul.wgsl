@@ -6,9 +6,11 @@
 // shared memory, then every thread does its 16 x 4 x 4 multiply-adds from there. Each staged
 // value is read by 16 threads, so global traffic drops 16x against the naive kernel (D19).
 //
-// Every output is the serial sum fma(x[i, k], w[k, o], acc) for k = 0, 1, ..., n_in - 1, the
-// same sequence matvec.wgsl computes, so a row of a batch and the same row alone have
-// identical bits (D46).
+// Chunked sum (D51): every output is 0 + p0 + p1 + ..., added in chunk order, where chunk c's
+// partial is the serial chain fma(x[i, k], w[k, o], p) from p = 0 over k in [256 c, 256 c + 256).
+// matvec.wgsl computes the same sequence, so a row of a batch and the same row alone have
+// identical bits (D46). Here the chunks run one after the other: every CHUNK / BK = 16 steps the
+// accumulators are added to the running totals and restart from 0.
 
 struct Params {
     t: u32,
@@ -29,6 +31,7 @@ const BM: u32 = TS * R;       // rows of out per workgroup
 const BN: u32 = TS * R;       // columns of out per workgroup
 const BK: u32 = 16u;          // k values staged per step
 const THREADS: u32 = TS * TS;
+const CHUNK: u32 = 256u;      // k values per chunk; matvec.wgsl must use the same (D51)
 
 // The staged slices, packed so one vec4 load gives a thread its 4 values for one k:
 // xs[k][j] = x rows j, j + 16, j + 32, j + 48 (of this tile) at k, and
@@ -36,7 +39,7 @@ const THREADS: u32 = TS * TS;
 var<workgroup> xs: array<array<vec4<f32>, TS>, BK>;
 var<workgroup> ws: array<array<vec4<f32>, TS>, BK>;
 
-// Row `i` of out, columns o, o + 16, o + 32, o + 48, from one accumulator. The bounds checks
+// Row `i` of out, columns o, o + 16, o + 32, o + 48, from one vector of totals. The bounds checks
 // must stay even though dropping the row check passes every test here (D50): WebGPU lets an
 // out-of-bounds write land anywhere in the same buffer, and this driver happens to drop it.
 fn store_row(i: u32, o: u32, acc: vec4<f32>) {
@@ -72,6 +75,11 @@ fn main(
     var acc1 = vec4(0.0);
     var acc2 = vec4(0.0);
     var acc3 = vec4(0.0);
+    // The running totals over finished chunks, same layout as acc.
+    var tot0 = vec4(0.0);
+    var tot1 = vec4(0.0);
+    var tot2 = vec4(0.0);
+    var tot3 = vec4(0.0);
     for (var k0 = 0u; k0 < params.n_in; k0 += BK) {
         // Stage the slices: BM * BK = BK * BN = 1024 values each, 4 per thread. Consecutive
         // threads load consecutive addresses (a 16-float run of an x row, a 64-float run of a w
@@ -115,14 +123,27 @@ fn main(
             acc2 = fma(vec4(a.z), bv, acc2);
             acc3 = fma(vec4(a.w), bv, acc3);
         }
+        // End of a chunk (CHUNK is a multiple of BK, so chunks end on step boundaries) or of K:
+        // fold the partials into the totals in chunk order, then start the next chunk from 0.
+        let k1 = k0 + BK;
+        if (k1 % CHUNK == 0u || k1 >= params.n_in) {
+            tot0 += acc0;
+            tot1 += acc1;
+            tot2 += acc2;
+            tot3 += acc3;
+            acc0 = vec4(0.0);
+            acc1 = vec4(0.0);
+            acc2 = vec4(0.0);
+            acc3 = vec4(0.0);
+        }
         // Every thread must finish reading this step's slices before the next step overwrites
         // them.
         workgroupBarrier();
     }
 
     let o = col0 + tx;
-    store_row(row0 + ty, o, acc0);
-    store_row(row0 + ty + TS, o, acc1);
-    store_row(row0 + ty + 2u * TS, o, acc2);
-    store_row(row0 + ty + 3u * TS, o, acc3);
+    store_row(row0 + ty, o, tot0);
+    store_row(row0 + ty + TS, o, tot1);
+    store_row(row0 + ty + 2u * TS, o, tot2);
+    store_row(row0 + ty + 3u * TS, o, tot3);
 }

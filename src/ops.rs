@@ -183,8 +183,8 @@ const NAIVE_TILE: usize = 16;
 /// Rows and columns of the output per `matmul` workgroup. Must match `BM` and `BN` in matmul.wgsl.
 const MATMUL_TILE: usize = 64;
 
-/// Outputs per `matvec` workgroup. Must match `WG` in matvec.wgsl.
-const MATVEC_WG: usize = 256;
+/// Outputs per `matvec` workgroup. Must match `OUTS` in matvec.wgsl.
+const MATVEC_OUTS: usize = 64;
 
 /// From this many outputs on, the matvec runs without lookahead (D48): measured on GPT-2's
 /// shapes, lookahead wins at 768-3072 outputs and loses at the LM head's 50257. The boundary
@@ -193,13 +193,13 @@ const MATVEC_WIDE: usize = 16384;
 
 /// `y = x @ w + b`: `x: [T, in]`, `w: [in, out]` (the GPU layout, D45), `b: [out]` or none.
 /// One row (a decode step) goes to the matrix-vector kernel, more rows to the tiled matmul
-/// (D43, D44). Both compute each output with the same serial sequence of fused multiply-adds,
+/// (D43, D44). Both compute each output as the same chunked sum of fused multiply-adds (D51),
 /// so a row's bits don't depend on which kernel ran it or what else was in the batch (D46).
 pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) -> Result<GpuTensor> {
     let (t, n_in, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
     let dims = (t, n_in, n_out);
     if t == 1 {
-        let groups = (n_out.div_ceil(MATVEC_WG), 1);
+        let groups = (n_out.div_ceil(MATVEC_OUTS), 1);
         let kernel = if n_out >= MATVEC_WIDE {
             &gpu.kernels.matvec_wide
         } else {
@@ -213,7 +213,8 @@ pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) ->
 }
 
 /// The M2 kernel (D19), kept as M6's baseline and as a second differential check (D49):
-/// `y = x @ w^T + b` with `w: [out, in]`, the CPU's layout (D7).
+/// `y = x @ w^T + b` with `w: [out, in]`, the CPU's layout (D7). A plain serial sum, so its bits
+/// differ from `linear`'s chunked sum (D53).
 pub fn linear_naive(
     gpu: &Gpu,
     x: &GpuTensor,
