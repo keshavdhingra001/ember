@@ -667,3 +667,35 @@ Model level: `ember profile` and `ember bench -n 32` on the 7-token prompt, the 
   - matmul writing row `t` (one past the end): this driver drops out-of-bounds writes. WebGPU
     also allows them to land elsewhere in the same buffer, so the check stays (like D22's gelu
     clamp).
+
+## M6 follow-up: split-K (approved 2026-10-07, not built yet)
+
+D50 left two gaps with one cause, too few threads: the 768-output matvecs run at 50% of the
+read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
+
+### D51: The linear kernels compute a chunked sum
+- **What:** per output, K is split into chunks of 256. Each chunk is a serial fma chain starting
+  from 0, and the chunk partials are added in chunk order: `((p0 + p1) + p2) + …`, then the
+  bias. `matmul` folds its accumulators into running totals every 16 BK steps; `matvec` computes
+  the partials in parallel and combines them in the same order.
+- **Alternatives:** split-K with a tolerance between decode and full recompute.
+- **Why:** it gives the matvec K/256 times more threads and keeps D33's bitwise decode check,
+  because both kernels still run one identical sequence of operations per output.
+
+### D52: Matvec: 64 outputs × 4 K slices per workgroup
+- **What:** 256 threads = 64 consecutive outputs × 4 slices. Slice threads compute the partials
+  of their chunks; the workgroup adds them in chunk order through shared memory, in rounds of 4
+  chunks, so any K works. `attn_out` goes from 768 to 2304 threads, `fc_out` to 9216.
+- **Alternatives:** more loads in flight (D48 already found 8 to be the best).
+
+### D53: The naive kernel stays a plain serial sum
+- **What:** `linear_naive` leaves the bitwise test (its order now differs) and keeps the
+  tolerance test against the CPU.
+
+### D54: The CPU oracle stays serial
+- **What:** the tolerance stays 1e-5, and the measured error under the chunked order is recorded.
+
+### D55: Small-T prefill is decided after measuring D51–D52
+- **What:** measure first, then choose between split-K in the matmul for small T and a narrower
+  tile. Expected gain from D51–D52 (an estimate, to be measured): attn_out + fc_out from 9.6 to
+  ~5.5 ms per step, decode ~28.5 → ~24 ms (~41 tokens/s).
