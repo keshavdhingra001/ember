@@ -752,8 +752,67 @@ fn into_ops_write_only_their_view() {
                 &format!("linear ({t}, {n_in}, {n_out}) bias {}", bias.is_some()),
                 &[t, n_out],
                 &want,
-                |r, o| ops::linear_into(r, &gx, &gw, bias, o),
+                |r, o| ops::linear_into(r, &gx, &gw, bias, ops::Epilogue::None, o),
             );
         }
     }
+}
+
+#[test]
+fn epilogues_equal_the_separate_kernels_bitwise() {
+    // D62: GELU fused into a linear kernel is gelu.wgsl's function on the same f32, and the
+    // fused residual is the add kernel's `res + y`; every kernel configuration, with and
+    // without a bias.
+    let g = gpu();
+    for (seed, (t, n_in, n_out)) in [
+        (1, 300, 70),
+        (1, 300, 2304),
+        (1, 20, 16384),
+        (5, 300, 70),
+        (5, 300, 2304),
+        (2, 20, 16384),
+        (70, 300, 130),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (x, w, b) = linear_case(t, n_in, n_out, 90 + seed as u64);
+        let (gx, gb) = (g.upload(&x), g.upload(&b));
+        let gw = g.upload(&cpu::transpose(&w).unwrap());
+        let res = g.upload(&random(&[t, n_out], -3.0, 3.0, 99));
+        for bias in [Some(&gb), None] {
+            let label = format!("({t}, {n_in}, {n_out}) bias {}", bias.is_some());
+            let y = ops::linear(g, &gx, &gw, bias).unwrap();
+            let fused = |ep| {
+                let out = g.alloc(&[t, n_out]);
+                let mut rec = g.rec();
+                ops::linear_into(&mut rec, &gx, &gw, bias, ep, &out).unwrap();
+                rec.submit();
+                g.read(&out).unwrap()
+            };
+            let want = g.read(&ops::gelu(g, &y).unwrap()).unwrap();
+            assert_eq!(
+                bits(&fused(ops::Epilogue::Gelu)),
+                bits(&want),
+                "gelu {label}"
+            );
+            let want = g.read(&ops::add(g, &res, &y).unwrap()).unwrap();
+            let got = fused(ops::Epilogue::Residual(&res));
+            assert_eq!(bits(&got), bits(&want), "residual {label}");
+        }
+    }
+}
+
+#[test]
+fn residual_epilogue_rejects_bad_buffers() {
+    let g = gpu();
+    let x = g.upload(&random(&[2, 8], -1.0, 1.0, 1));
+    let w = g.upload(&random(&[8, 4], -1.0, 1.0, 2));
+    let out = g.alloc(&[2, 4]);
+    let mut rec = g.rec();
+    let wrong = g.alloc(&[2, 5]);
+    let ep = ops::Epilogue::Residual;
+    assert!(ops::linear_into(&mut rec, &x, &w, None, ep(&wrong), &out).is_err());
+    // In place would bind one buffer read-only and read-write at once.
+    assert!(ops::linear_into(&mut rec, &x, &w, None, ep(&out), &out).is_err());
 }

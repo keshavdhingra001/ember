@@ -1,4 +1,5 @@
-// out[o] = x . w[:, o] + b[o] for one row x: [n_in], w: [n_in, n_out] (D45). The decode step
+// out[o] = x . w[:, o] + b[o] for one row x: [n_in], w: [n_in, n_out] (D45), then the epilogue
+// (D62). The decode step
 // (T = 1, D44): a 64 x 64 matmul tile would leave 63 of its 64 rows empty.
 //
 // Chunked sum (D51): K is cut into chunks of CHUNK = 256. Each chunk's partial is a serial chain
@@ -34,7 +35,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+// binding 4: `res`, in epilogue.wgsl (prepended), which also has finish()
+@group(0) @binding(5) var<uniform> params: Params;
 
 const WG: u32 = 256u;
 const CHUNK: u32 = 256u;            // k values per chunk; matmul.wgsl must use the same (D51)
@@ -127,9 +129,6 @@ fn main(
         }
     }
     if (live && s == 0u) {
-        if (params.has_bias != 0u) {
-            total += b[o];
-        }
-        out[o] = total;
+        out[o] = finish(o, o, total);
     }
 }

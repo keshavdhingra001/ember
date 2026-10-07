@@ -304,6 +304,27 @@ const MATVEC_SPLIT: usize = 1024;
 /// between them is not measured.
 const MATVEC_WIDE: usize = 16384;
 
+/// What a linear kernel does after the bias (D62).
+#[derive(Clone, Copy)]
+pub enum Epilogue<'a> {
+    None,
+    /// GELU of every output (the MLP's `fc`).
+    Gelu,
+    /// `res + y`, `res` of the output's shape: the residual add after `attn_out` and `fc_out`.
+    Residual(&'a GpuTensor),
+}
+
+impl Epilogue<'_> {
+    /// Index into the kernels' epilogue arrays; must match `EPILOGUE` in epilogue.wgsl.
+    fn index(self) -> usize {
+        match self {
+            Epilogue::None => 0,
+            Epilogue::Gelu => 1,
+            Epilogue::Residual(_) => 2,
+        }
+    }
+}
+
 /// `y = x @ w + b`: `x: [T, in]`, `w: [in, out]` (the GPU layout, D45), `b: [out]` or none.
 /// One row (a decode step) goes to the matrix-vector kernel, up to 8 rows (a short prefill) to
 /// its multi-row form, more rows to the tiled matmul (D43, D44, D57). All compute each output as
@@ -311,36 +332,41 @@ const MATVEC_WIDE: usize = 16384;
 /// so a row's bits don't depend on which kernel ran it or what else was in the batch (D46).
 pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) -> Result<GpuTensor> {
     let (t, _, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
-    once(gpu, &[t, n_out], |rec, out| linear_into(rec, x, w, b, out))
+    once(gpu, &[t, n_out], |rec, out| {
+        linear_into(rec, x, w, b, Epilogue::None, out)
+    })
 }
 
-/// `linear` into `out` (D61).
+/// `linear` into `out` (D61), then `epilogue` (D62).
 pub fn linear_into(
     rec: &mut Rec,
     x: &GpuTensor,
     w: &GpuTensor,
     b: Option<&GpuTensor>,
+    epilogue: Epilogue,
     out: &GpuTensor,
 ) -> Result<()> {
     let (t, n_in, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
     let dims = (t, n_in, n_out);
     let gpu = rec.gpu;
+    let ep = epilogue.index();
     if t <= MATVEC_ROWS {
         let k = &gpu.kernels;
         let (kernel, slices) = match (t == 1, n_out) {
-            (true, ..=MATVEC_SPLIT) => (&k.matvec_split, 4),
-            (true, ..MATVEC_WIDE) => (&k.matvec, 1),
-            (true, _) => (&k.matvec_wide, 1),
-            (false, ..=MATVEC_SPLIT) => (&k.matvec_rows_split, 4),
-            (false, ..MATVEC_WIDE) => (&k.matvec_rows, 1),
-            (false, _) => (&k.matvec_rows_wide, 1),
+            (true, ..=MATVEC_SPLIT) => (&k.matvec_split[ep], 4),
+            (true, ..MATVEC_WIDE) => (&k.matvec[ep], 1),
+            (true, _) => (&k.matvec_wide[ep], 1),
+            (false, ..=MATVEC_SPLIT) => (&k.matvec_rows_split[ep], 4),
+            (false, ..MATVEC_WIDE) => (&k.matvec_rows[ep], 1),
+            (false, _) => (&k.matvec_rows_wide[ep], 1),
         };
         // Must match the shader's outs = WG / SLICES.
         let groups = (n_out.div_ceil(MATVEC_WG / slices), 1);
-        linear_dispatch(rec, kernel, x, w, b, dims, groups, out)
+        linear_dispatch(rec, kernel, x, w, b, dims, groups, Some(epilogue), out)
     } else {
         let groups = (n_out.div_ceil(MATMUL_TILE), t.div_ceil(MATMUL_TILE));
-        linear_dispatch(rec, &gpu.kernels.matmul, x, w, b, dims, groups, out)
+        let kernel = &gpu.kernels.matmul[ep];
+        linear_dispatch(rec, kernel, x, w, b, dims, groups, Some(epilogue), out)
     }
 }
 
@@ -357,12 +383,23 @@ pub fn linear_naive(
     let (t, _, n_out) = dims;
     let groups = (n_out.div_ceil(NAIVE_TILE), t.div_ceil(NAIVE_TILE));
     once(gpu, &[t, n_out], |rec, out| {
-        linear_dispatch(rec, &gpu.kernels.linear_naive, x, w, b, dims, groups, out)
+        linear_dispatch(
+            rec,
+            &gpu.kernels.linear_naive,
+            x,
+            w,
+            b,
+            dims,
+            groups,
+            None,
+            out,
+        )
     })
 }
 
-/// Shared by the three linear kernels: they take the same bindings and `(t, in, out, has_bias)`
+/// Shared by the linear kernels: they take the same bindings and `(t, in, out, has_bias)`
 /// parameters, `dims = (t, in, out)` already checked against the kernel's weight layout.
+/// `epilogue` is `None` for `linear_naive`, which has none (and no `res` binding).
 #[allow(clippy::too_many_arguments)]
 fn linear_dispatch(
     rec: &mut Rec,
@@ -372,9 +409,25 @@ fn linear_dispatch(
     b: Option<&GpuTensor>,
     (t, n_in, n_out): (usize, usize, usize),
     (gx, gy): (usize, usize),
+    epilogue: Option<Epilogue>,
     out: &GpuTensor,
 ) -> Result<()> {
     check_out("linear", out, &[t, n_out])?;
+    if let Some(Epilogue::Residual(r)) = epilogue {
+        if r.shape() != out.shape() {
+            return Err(Error::Shape(format!(
+                "linear: residual {:?} for output {:?}",
+                r.shape(),
+                out.shape()
+            )));
+        }
+        // Read-only and read-write in one dispatch is a validation error, not an Err.
+        if r.buffer == out.buffer {
+            return Err(Error::Shape(
+                "linear: residual and output share a buffer".into(),
+            ));
+        }
+    }
     if t == 0 || n_out == 0 {
         return Ok(());
     }
@@ -391,12 +444,25 @@ fn linear_dispatch(
     // that binding, and binding one buffer twice read-only is allowed (`out`, read-write,
     // would be a validation error). A buffer allocated for it would be a creation per call (D60).
     let bias = b.map_or(&w.buffer, |b| &b.buffer);
-    rec.dispatch(
-        kernel,
-        &[&x.buffer, &w.buffer, bias, &out.buffer],
-        bytemuck::bytes_of(&params),
-        (gx as u32, gy as u32, 1),
-    )
+    let groups = (gx as u32, gy as u32, 1);
+    let params = bytemuck::bytes_of(&params);
+    match epilogue {
+        None => rec.dispatch(
+            kernel,
+            &[&x.buffer, &w.buffer, bias, &out.buffer],
+            params,
+            groups,
+        ),
+        // The residual binding without a residual gets `x`, as the bias binding gets `w`.
+        Some(ep) => {
+            let res = match ep {
+                Epilogue::Residual(r) => &r.buffer,
+                _ => &x.buffer,
+            };
+            let buffers = [&x.buffer, &w.buffer, bias, &out.buffer, res];
+            rec.dispatch(kernel, &buffers, params, groups)
+        }
+    }
 }
 
 #[repr(C)]

@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gpt2::forward::greedy;
 use crate::gpt2::{Config, Linear, Norm, Weights};
 use crate::gpu::{Binds, Gpu, Rec};
-use crate::ops;
+use crate::ops::{self, Epilogue};
 use crate::tensor::{GpuTensor, Tensor};
 
 pub struct GpuLinear {
@@ -94,7 +94,7 @@ pub fn forward(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<GpuTensor> {
         &Attend::Recompute,
     )?;
     let logits = gpu.alloc(&[ids.len(), w.config.vocab_size]);
-    ops::linear_into(&mut rec, &h, &w.wte_t, None, &logits)?;
+    ops::linear_into(&mut rec, &h, &w.wte_t, None, Epilogue::None, &logits)?;
     rec.submit();
     Ok(logits)
 }
@@ -129,9 +129,7 @@ enum Role {
     Norm,
     Qkv,
     Att,
-    Proj,
     Fc,
-    Act,
     Last,
     Logits,
 }
@@ -221,23 +219,34 @@ fn block(
     let h = out(Role::Norm, e)?;
     ops::layer_norm_into(rec, x, &b.ln_1.gain, &b.ln_1.bias, eps, &h)?;
     let qkv = out(Role::Qkv, 3 * e)?;
-    ops::linear_into(rec, &h, &b.qkv.w, Some(&b.qkv.b), &qkv)?;
+    let none = Epilogue::None;
+    ops::linear_into(rec, &h, &b.qkv.w, Some(&b.qkv.b), none, &qkv)?;
     let a = out(Role::Att, e)?;
     attend(rec, &qkv, &a)?;
-    let p = out(Role::Proj, e)?;
-    ops::linear_into(rec, &a, &b.attn_out.w, Some(&b.attn_out.b), &p)?;
+    // The residual adds and GELU happen in the linear kernels' epilogue (D62).
     let mid = out(Role::ResB, e)?;
-    ops::add_into(rec, x, &p, &mid)?;
+    let (attn_out, fc, fc_out) = (&b.attn_out, &b.fc, &b.fc_out);
+    ops::linear_into(
+        rec,
+        &a,
+        &attn_out.w,
+        Some(&attn_out.b),
+        Epilogue::Residual(x),
+        &mid,
+    )?;
 
     ops::layer_norm_into(rec, &mid, &b.ln_2.gain, &b.ln_2.bias, eps, &h)?;
-    let n_fc = b.fc.b.len();
-    let f = out(Role::Fc, n_fc)?;
-    ops::linear_into(rec, &h, &b.fc.w, Some(&b.fc.b), &f)?;
-    let g = out(Role::Act, n_fc)?;
-    ops::gelu_into(rec, &f, &g)?;
-    ops::linear_into(rec, &g, &b.fc_out.w, Some(&b.fc_out.b), &p)?;
+    let f = out(Role::Fc, fc.b.len())?;
+    ops::linear_into(rec, &h, &fc.w, Some(&fc.b), Epilogue::Gelu, &f)?;
     let y = out(Role::ResA, e)?;
-    ops::add_into(rec, &mid, &p, &y)?;
+    ops::linear_into(
+        rec,
+        &f,
+        &fc_out.w,
+        Some(&fc_out.b),
+        Epilogue::Residual(&mid),
+        &y,
+    )?;
     Ok(y)
 }
 
@@ -263,7 +272,7 @@ fn last_logits(rec: &mut Rec, bufs: &Bufs, w: &GpuWeights, h: &GpuTensor) -> Res
     let last = bufs.out(gpu, Role::Last, &[1, w.config.n_embd])?;
     ops::row_into(rec, h, h.shape()[0] - 1, &last)?;
     let logits = bufs.out(gpu, Role::Logits, &[1, w.config.vocab_size])?;
-    ops::linear_into(rec, &last, &w.wte_t, None, &logits)?;
+    ops::linear_into(rec, &last, &w.wte_t, None, Epilogue::None, &logits)?;
     Ok(logits)
 }
 
@@ -296,9 +305,9 @@ impl Workspace {
         let (rows, e, v) = (config.n_ctx, config.n_embd, config.vocab_size);
         // GPT-2's MLP is 4E wide; another width fails `Bufs::out`'s size check.
         let floats = |role| match role {
-            Role::ResA | Role::ResB | Role::Norm | Role::Att | Role::Proj => rows * e,
+            Role::ResA | Role::ResB | Role::Norm | Role::Att => rows * e,
             Role::Qkv => rows * 3 * e,
-            Role::Fc | Role::Act => rows * 4 * e,
+            Role::Fc => rows * 4 * e,
             Role::Last => e,
             Role::Logits => v,
         };
@@ -308,9 +317,7 @@ impl Workspace {
             Role::Norm,
             Role::Qkv,
             Role::Att,
-            Role::Proj,
             Role::Fc,
-            Role::Act,
             Role::Last,
             Role::Logits,
         ];
@@ -328,7 +335,7 @@ impl Workspace {
 
 impl KvCache {
     /// Allocate K and V of `[n_ctx, E]` for every layer (75.5 MB for GPT-2 124M) and the
-    /// workspace (D59; 50 MB for GPT-2 124M).
+    /// workspace (D59; 35 MB for GPT-2 124M).
     pub fn new(gpu: &Gpu, config: &Config) -> Self {
         let shape = [config.n_ctx, config.n_embd];
         KvCache {

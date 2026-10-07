@@ -48,19 +48,16 @@ fn one_label_and_time_per_dispatch_in_order() {
     let times = g.profile_finish().unwrap();
 
     // Three rows: the block's matrices (12 to 48 outputs) run on the multi-row matvec that splits
-    // K (D57, D56).
+    // K (D57, D56); the residual adds and GELU are their epilogues (D62).
     let block = [
         "layer_norm",
         "matvec_rows_split",
         "kv_write",
         "attention",
-        "matvec_rows_split",
-        "add",
+        "matvec_rows_split+res",
         "layer_norm",
-        "matvec_rows_split",
-        "gelu",
-        "matvec_rows_split",
-        "add",
+        "matvec_rows_split+gelu",
+        "matvec_rows_split+res",
     ];
     let mut want = vec!["embed"];
     want.extend(block);
@@ -75,7 +72,8 @@ fn one_label_and_time_per_dispatch_in_order() {
         .into_iter()
         .find(|k| k.0 == "matvec_rows_split")
         .unwrap();
-    assert_eq!(rows.1, 8);
+    // One per block (qkv); attn_out, fc and fc_out are grouped under their epilogue's name.
+    assert_eq!(rows.1, 2);
 }
 
 #[test]

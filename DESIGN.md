@@ -888,6 +888,14 @@ position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
   `fc` uses GELU; `attn_out` and `fc_out` add the residual (f32 addition commutes, so
   `x + y` is the same bits as the separate `add` kernel's). 135 → 99 dispatches before D63.
 - **Alternatives:** fuse LayerNorm too (harder, small gain); no fusion.
+- **Built (2026-10-08):** `epilogue.wgsl` (with `gelu_fn.wgsl`, now also prepended to
+  `gelu.wgsl`) is prepended to the three kernels; `res` is binding 4, the params moved to 5.
+  Kernels without a residual bind `x` there (as a missing bias binds `w`). Each linear kernel
+  is compiled 3 times (21 pipelines instead of 7): `ember info` 47 → 59 ms (3 runs each, wall
+  clock; Mesa may cache compiled shaders across runs). Tested bitwise against `gelu` and `add`
+  run separately for all 7 kernel configurations, and through the whole model (tiny and GPT-2
+  124M) against the one-op path: equal on this driver. The profiler reports the fused kernels
+  as `matvec+gelu`, `matvec_split+res` and so on.
 
 ### D63: Attention splits keys into chunks of 64 with an online softmax
 - **What:** pass 1, one workgroup per (query row, head, key chunk of 64): stage the chunk's keys

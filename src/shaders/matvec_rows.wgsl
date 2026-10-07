@@ -23,7 +23,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+// binding 4: `res`, in epilogue.wgsl (prepended), which also has finish()
+@group(0) @binding(5) var<uniform> params: Params;
 
 const WG: u32 = 256u;
 const CHUNK: u32 = 256u;            // k values per chunk; matmul.wgsl must use the same (D51)
@@ -40,14 +41,12 @@ var<workgroup> xs: array<array<vec4<f32>, 2>, MAX_SLICES * SUB>;
 // parts[s * outs + j][h]: this round's partials of slice s for output j, rows 4h .. 4h + 3.
 var<workgroup> parts: array<array<vec4<f32>, 2>, WG>;
 
-// Row `i` of out at column `o`, from the total; rows past t aren't written.
+// Row `i` of out at column `o`, from the total (bias and epilogue in finish(), D62); rows past
+// t aren't written.
 fn store(i: u32, o: u32, total: f32) {
     if (i < params.t) {
-        var v = total;
-        if (params.has_bias != 0u) {
-            v += b[o];
-        }
-        out[i * params.n_out + o] = v;
+        let idx = i * params.n_out + o;
+        out[idx] = finish(idx, o, total);
     }
 }
 

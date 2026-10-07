@@ -44,13 +44,14 @@ pub(crate) struct Kernels {
     pub softmax: Kernel,
     pub layer_norm: Kernel,
     pub linear_naive: Kernel,
-    pub matmul: Kernel,
-    pub matvec: Kernel,
-    pub matvec_wide: Kernel,
-    pub matvec_split: Kernel,
-    pub matvec_rows: Kernel,
-    pub matvec_rows_wide: Kernel,
-    pub matvec_rows_split: Kernel,
+    // The linear kernels, each compiled once per epilogue (D62), indexed by `Epilogue::index`.
+    pub matmul: [Kernel; 3],
+    pub matvec: [Kernel; 3],
+    pub matvec_wide: [Kernel; 3],
+    pub matvec_split: [Kernel; 3],
+    pub matvec_rows: [Kernel; 3],
+    pub matvec_rows_wide: [Kernel; 3],
+    pub matvec_rows_split: [Kernel; 3],
     pub attention: Kernel,
     pub kv_write: Kernel,
     pub copy: Kernel,
@@ -94,11 +95,27 @@ impl Gpu {
         let k = |name, src| compute_pipeline(&device, name, src, &[]);
         // The row kernels share reduce.wgsl's trees: same source text, prepended.
         let with_reduce = |src: &str| [include_str!("shaders/reduce.wgsl"), src].concat();
+        // A linear kernel once per epilogue (D62): epilogue.wgsl and the GELU it uses prepended,
+        // plus the kernel's own override constants. `names` are the profiler's labels.
+        let gelu_fn = include_str!("shaders/gelu_fn.wgsl");
+        let linear_src = |src: &str| [gelu_fn, include_str!("shaders/epilogue.wgsl"), src].concat();
+        let linear = |names: [&'static str; 3], src: &str, constants: &[(&str, f64)]| {
+            let src = linear_src(src);
+            names.map(|name| {
+                let epilogue = match name.split_once('+') {
+                    None => 0.0,
+                    Some((_, "gelu")) => 1.0,
+                    Some(_) => 2.0,
+                };
+                let mut c = constants.to_vec();
+                c.push(("EPILOGUE", epilogue));
+                compute_pipeline(&device, name, &src, &c)
+            })
+        };
         // matvec.wgsl or matvec_rows.wgsl with their two override constants.
-        let matvec = |name, src, slices: u32, lookahead: bool| {
-            compute_pipeline(
-                &device,
-                name,
+        let matvec = |names, src, slices: u32, lookahead: bool| {
+            linear(
+                names,
                 src,
                 &[
                     ("SLICES", slices as f64),
@@ -108,7 +125,10 @@ impl Gpu {
         };
         let kernels = Kernels {
             add: k("add", include_str!("shaders/add.wgsl")),
-            gelu: k("gelu", include_str!("shaders/gelu.wgsl")),
+            gelu: k(
+                "gelu",
+                &[gelu_fn, include_str!("shaders/gelu.wgsl")].concat(),
+            ),
             embed: k("embed", include_str!("shaders/embed.wgsl")),
             softmax: k(
                 "softmax",
@@ -119,15 +139,52 @@ impl Gpu {
                 &with_reduce(include_str!("shaders/layer_norm.wgsl")),
             ),
             linear_naive: k("linear_naive", include_str!("shaders/linear_naive.wgsl")),
-            matmul: k("matmul", include_str!("shaders/matmul.wgsl")),
+            matmul: linear(
+                ["matmul", "matmul+gelu", "matmul+res"],
+                include_str!("shaders/matmul.wgsl"),
+                &[],
+            ),
             // One source, three configurations (D48, D56): (slices, lookahead).
-            matvec: matvec("matvec", MATVEC, 1, true),
-            matvec_wide: matvec("matvec_wide", MATVEC, 1, false),
-            matvec_split: matvec("matvec_split", MATVEC, 4, true),
+            matvec: matvec(["matvec", "matvec+gelu", "matvec+res"], MATVEC, 1, true),
+            matvec_wide: matvec(
+                ["matvec_wide", "matvec_wide+gelu", "matvec_wide+res"],
+                MATVEC,
+                1,
+                false,
+            ),
+            matvec_split: matvec(
+                ["matvec_split", "matvec_split+gelu", "matvec_split+res"],
+                MATVEC,
+                4,
+                true,
+            ),
             // The same three for 2-8 rows (D57).
-            matvec_rows: matvec("matvec_rows", MATVEC_ROWS, 1, true),
-            matvec_rows_wide: matvec("matvec_rows_wide", MATVEC_ROWS, 1, false),
-            matvec_rows_split: matvec("matvec_rows_split", MATVEC_ROWS, 4, true),
+            matvec_rows: matvec(
+                ["matvec_rows", "matvec_rows+gelu", "matvec_rows+res"],
+                MATVEC_ROWS,
+                1,
+                true,
+            ),
+            matvec_rows_wide: matvec(
+                [
+                    "matvec_rows_wide",
+                    "matvec_rows_wide+gelu",
+                    "matvec_rows_wide+res",
+                ],
+                MATVEC_ROWS,
+                1,
+                false,
+            ),
+            matvec_rows_split: matvec(
+                [
+                    "matvec_rows_split",
+                    "matvec_rows_split+gelu",
+                    "matvec_rows_split+res",
+                ],
+                MATVEC_ROWS,
+                4,
+                true,
+            ),
             attention: k(
                 "attention",
                 &with_reduce(include_str!("shaders/attention.wgsl")),

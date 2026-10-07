@@ -23,7 +23,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read> w: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+// binding 4: `res`, in epilogue.wgsl (prepended), which also has finish()
+@group(0) @binding(5) var<uniform> params: Params;
 
 const TS: u32 = 16u;          // threads per side of the workgroup
 const R: u32 = 4u;            // rows and columns of out per thread
@@ -39,7 +40,8 @@ const CHUNK: u32 = 256u;      // k values per chunk; matvec.wgsl must use the sa
 var<workgroup> xs: array<array<vec4<f32>, TS>, BK>;
 var<workgroup> ws: array<array<vec4<f32>, TS>, BK>;
 
-// Row `i` of out, columns o, o + 16, o + 32, o + 48, from one vector of totals. The bounds checks
+// Row `i` of out, columns o, o + 16, o + 32, o + 48, from one vector of totals; bias and epilogue
+// in finish() (D62). The bounds checks
 // must stay even though dropping the row check passes every test here (D50): WebGPU lets an
 // out-of-bounds write land anywhere in the same buffer, and this driver happens to drop it.
 fn store_row(i: u32, o: u32, acc: vec4<f32>) {
@@ -49,11 +51,8 @@ fn store_row(i: u32, o: u32, acc: vec4<f32>) {
     for (var c = 0u; c < R; c++) {
         let col = o + TS * c;
         if (col < params.n_out) {
-            var v = acc[c];
-            if (params.has_bias != 0u) {
-                v += b[col];
-            }
-            out[i * params.n_out + col] = v;
+            let idx = i * params.n_out + col;
+            out[idx] = finish(idx, col, acc[c]);
         }
     }
 }
