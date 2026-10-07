@@ -918,6 +918,12 @@ position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
   T = 63, 64, 65, 1023, 1024, 1025, 1300 against the CPU at the unchanged tolerance, a dominant
   key in chunk 2 (the combine must rescale to the global max), the d > 64 and short-scratch
   rejections, and the existing bitwise decode-vs-recompute tests.
+- **Fix (§4):** the first version staged both 32-key halves for every chunk, with an integer
+  divide and modulo per element, even when the row had only a few keys there. A 7-token prefill's
+  attention took 0.79 ms against the old kernel's 0.31 (12 layers, timestamp queries), and the
+  uncached path, which recomputes short sequences, slowed down. Now only the halves that hold
+  keys are staged, one key row per step (thread l loads dim l, d <= 64 = WG). Same arithmetic,
+  same bits.
 
 ### D64: M7 tests
 - **What:** outputs into oversized buffers pre-filled with sentinels (D9): the elements past the

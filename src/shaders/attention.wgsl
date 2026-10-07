@@ -71,20 +71,22 @@ fn main(
         qs[cc] = qkv[i * 3u * e + hd + cc];
     }
 
-    // 1. Scores: two halves of 32 keys; thread l scores key l (in half l / 32).
+    // 1. Scores, 32 keys at a time; thread l scores key l (in half l / 32). Only the halves
+    // that hold keys are staged: a row near the start of its chunk (a short prompt, a decode
+    // step just past a chunk edge) has fewer than 32. n is the same for the whole workgroup, so
+    // every thread runs the same iterations and reaches the same barriers.
     var s = LOWEST;
-    for (var half = 0u; half < KC / HALF; half++) {
-        let h0 = half * HALF;
-        // Stage keys h0 .. h0 + 31 of the chunk; consecutive threads read consecutive dims.
-        for (var idx = l; idx < HALF * d; idx += WG) {
-            let r = idx / d;
-            let cc = idx % d;
-            if (h0 + r < n) {
-                ks[r * STRIDE + cc] = k_cache[(j0 + h0 + r) * e + hd + cc];
+    for (var h0 = 0u; h0 < n; h0 += HALF) {
+        // Stage keys h0 .. h0 + 31 of the chunk, one key row per step: thread l loads dim l
+        // (d <= MAX_D = WG), so each step is one coalesced read of d floats.
+        let rows = min(HALF, n - h0);
+        for (var r = 0u; r < rows; r++) {
+            if (l < d) {
+                ks[r * STRIDE + l] = k_cache[(j0 + h0 + r) * e + hd + l];
             }
         }
         workgroupBarrier();  // the half is staged (and q, the first time)
-        if (l >= h0 && l < h0 + HALF && l < n) {
+        if (l >= h0 && l < h0 + rows) {
             var dot = 0.0;
             for (var cc = 0u; cc < d; cc++) {
                 dot += qs[cc] * ks[(l - h0) * STRIDE + cc];
