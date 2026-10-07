@@ -534,7 +534,7 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Ok(step_ms(&samples).0)
     };
 
-    // Compute roof: 4096 x 256 invocations, 8 chains x 2048 steps each = 34.4 GFLOP.
+    // Compute roof: 4096 x 256 invocations, 32 chains x 2048 steps each = 137 GFLOP.
     let (groups, iters) = (4096u32, 2048u32);
     let peak_ms = time(&|| ops::fma_peak(&gpu, groups, iters))?;
     let peak_flops = 2.0 * (ops::FMA_PEAK_CHAINS * iters as usize * 256 * groups as usize) as f64;
@@ -544,9 +544,12 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let src = gpu.upload(&Tensor::new(&[n], vec![1.0; n])?);
     let copy_ms = time(&|| ops::copy(&gpu, &src))?;
     let copy_gbs = 2.0 * (n * 4) as f64 / (copy_ms * 1e6);
+    let read_ms = time(&|| ops::read_peak(&gpu, &src))?;
+    let read_gbs = (n * 4) as f64 / (read_ms * 1e6);
     drop(src);
     println!("compute roof (fma_peak)  {peak:7.1} GFLOP/s");
-    println!("bandwidth roof (copy)    {copy_gbs:7.1} GB/s");
+    println!("copy (D41)               {copy_gbs:7.1} GB/s read + written");
+    println!("read roof (read_peak)    {read_gbs:7.1} GB/s");
 
     // GPT-2's block matrices (in, out), and the LM head.
     let mats = [
@@ -590,40 +593,85 @@ fn matmul_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\ndecode (T = 1): weight GB/s (% of the bandwidth roof)");
+    // Decode: one GPT-2 step's matrices, 12 distinct copies of each block matrix plus the head,
+    // run in model order. Distinct copies matter: one 2-9 MB matrix timed over and over stays
+    // in the last-level cache (shared with the CPU on this chip) and "beats" DRAM bandwidth.
+    println!(
+        "\ndecode (T = 1), one step's matrices in model order: weight GB/s (% of the read roof)"
+    );
     println!(
         "  {:<9} {:>9} {:>18} {:>18} {:>8}",
         "matrix", "MB", "naive", "matvec", "speedup"
     );
+    let n_layer = 12;
+    let order: Vec<usize> = (0..n_layer)
+        .flat_map(|_| 0..4)
+        .chain(std::iter::once(4))
+        .collect();
+    let xs = [random(&[1, 768])?, random(&[1, 3072])?];
+    let x_for = |n_in: usize| if n_in == 768 { &xs[0] } else { &xs[1] };
+    // Median per-kind ms of a whole step, for one kernel and weight layout.
+    let mut step = |naive: bool| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        let ws = order
+            .iter()
+            .map(|&m| {
+                let (_, n_in, n_out) = mats[m];
+                random(&if naive { [n_out, n_in] } else { [n_in, n_out] })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut per_kind: Vec<Vec<f64>> = vec![Vec::new(); mats.len()];
+        for run in 0..=runs {
+            let ((), s) = measure(&gpu, || {
+                for (&m, w) in order.iter().zip(&ws) {
+                    let x = x_for(mats[m].1);
+                    if naive {
+                        ops::linear_naive(&gpu, x, w, None)?;
+                    } else {
+                        ops::linear(&gpu, x, w, None)?;
+                    }
+                }
+                Ok(())
+            })?;
+            if run > 0 {
+                let mut sums = vec![0.0; mats.len()];
+                for (&m, k) in order.iter().zip(&s.kernels) {
+                    sums[m] += k.ns / 1e6;
+                }
+                for (v, x) in per_kind.iter_mut().zip(sums) {
+                    v.push(x);
+                }
+            }
+        }
+        Ok(per_kind.into_iter().map(median).collect())
+    };
+    let naive = step(true)?;
+    let matvec = step(false)?;
     let (mut naive_total, mut matvec_total, mut bytes_total) = (0.0, 0.0, 0.0);
-    for &(name, n_in, n_out) in &mats {
-        let w_out_in = random(&[n_out, n_in])?;
-        let w_in_out = random(&[n_in, n_out])?;
-        let x = random(&[1, n_in])?;
-        let bytes = 4.0 * (n_in * n_out) as f64;
-        let naive = time(&|| ops::linear_naive(&gpu, &x, &w_out_in, None))?;
-        let matvec = time(&|| ops::linear(&gpu, &x, &w_in_out, None))?;
+    for (m, &(name, n_in, n_out)) in mats.iter().enumerate() {
+        let reps = if name == "lm_head" { 1 } else { n_layer };
+        let bytes = 4.0 * (reps * n_in * n_out) as f64;
         let gbs = |ms: f64| bytes / (ms * 1e6);
-        // A decode step runs each block matrix 12 times and the head once.
-        let reps = if name == "lm_head" { 1.0 } else { 12.0 };
-        naive_total += reps * naive;
-        matvec_total += reps * matvec;
-        bytes_total += reps * bytes;
+        naive_total += naive[m];
+        matvec_total += matvec[m];
+        bytes_total += bytes;
         println!(
             "  {name:<9} {:>9.1} {:>8.1} ({:>4.0}%) {:>8.1} ({:>4.0}%) {:>7.1}x",
             bytes / 1e6,
-            gbs(naive),
-            100.0 * gbs(naive) / copy_gbs,
-            gbs(matvec),
-            100.0 * gbs(matvec) / copy_gbs,
-            naive / matvec
+            gbs(naive[m]),
+            100.0 * gbs(naive[m]) / read_gbs,
+            gbs(matvec[m]),
+            100.0 * gbs(matvec[m]) / read_gbs,
+            naive[m] / matvec[m]
         );
     }
     println!(
-        "  GPT-2 step: {:.0} MB of matrices, naive {naive_total:.2} ms, matvec {matvec_total:.2} ms = {:.1} GB/s ({:.0}% of the roof)",
+        "  step      {:>9.1} {:>8.1} ({:>4.0}%) {:>8.1} ({:>4.0}%) {:>7.1}x   ({naive_total:.2} ms vs {matvec_total:.2} ms)",
         bytes_total / 1e6,
+        bytes_total / (naive_total * 1e6),
+        100.0 * bytes_total / (naive_total * 1e6) / read_gbs,
         bytes_total / (matvec_total * 1e6),
-        100.0 * bytes_total / (matvec_total * 1e6) / copy_gbs
+        100.0 * bytes_total / (matvec_total * 1e6) / read_gbs,
+        naive_total / matvec_total
     );
     Ok(())
 }

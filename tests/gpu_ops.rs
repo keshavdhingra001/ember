@@ -290,9 +290,16 @@ fn linear_naive_matches_cpu() {
 fn every_linear_kernel_gives_a_row_the_same_bits() {
     let g = gpu();
     let bits = |t: &Tensor| t.data().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-    for (seed, (t, n_in, n_out)) in [(70, 777, 130), (5, 3072, 768), (3, 768, 2304)]
-        .into_iter()
-        .enumerate()
+    // 777 = 3 matvec chunks of 256 and 9 left over (one past the 8-load lookahead); 16384
+    // outputs run the matvec without lookahead (D48).
+    for (seed, (t, n_in, n_out)) in [
+        (70, 777, 130),
+        (5, 3072, 768),
+        (3, 768, 2304),
+        (2, 100, 16384),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (x, w, b) = linear_case(t, n_in, n_out, 50 + seed as u64);
         let (gx, gb) = (g.upload(&x), g.upload(&b));
@@ -462,6 +469,33 @@ fn copy_kernel_is_exact() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn read_peak_reads_every_element_once() {
+    // Small integers, so every partial sum is exact and only a skipped or doubled element can
+    // change the total. 1024 workgroups x 256 invocations = 262144 vec4s per sweep: one size
+    // below that, two that wrap the grid-stride loop.
+    let g = gpu();
+    for n4 in [5, 262_144 + 3, 3 * 262_144] {
+        let x: Vec<f32> = (0..4 * n4).map(|i| (i % 7) as f32).collect();
+        let want: f64 = x.iter().map(|&v| v as f64).sum();
+        let gx = g.upload(&Tensor::new(&[4 * n4], x).unwrap());
+        let sums = g.read(&ops::read_peak(g, &gx).unwrap()).unwrap();
+        let got: f64 = sums.data().iter().map(|&v| v as f64).sum();
+        assert_eq!(got, want, "{n4} vec4s");
+    }
+    assert!(ops::read_peak(g, &g.upload(&Tensor::zeros(&[6]))).is_err());
+    assert!(ops::read_peak(g, &g.upload(&Tensor::zeros(&[0]))).is_err());
+}
+
+#[test]
+fn fma_peak_runs() {
+    let g = gpu();
+    let out = g.read(&ops::fma_peak(g, 2, 10).unwrap()).unwrap();
+    assert_eq!(out.len(), 2 * 256);
+    assert!(out.data().iter().all(|v| v.is_finite() && *v > 0.0));
+    assert!(ops::fma_peak(g, 0, 10).is_err());
 }
 
 // ------------------------------------------------------------------ KV cache (M4)

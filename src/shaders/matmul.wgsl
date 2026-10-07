@@ -1,6 +1,6 @@
 // out[i, o] = x[i, :] . w[:, o] + b[o]: x is [t, n_in], w is [n_in, n_out] (the GPU layout, D45).
 // Tiled (D43): a 16 x 16 workgroup computes a BM x BN = 64 x 64 block of out. Each thread owns a
-// 4 x 4 block of it in registers: rows ty + 16 * r and columns tx + 16 * c, so neighbouring
+// 4 x 4 block of it in registers (four vec4 accumulators): rows ty + 16 * r and columns tx + 16 * c, so neighbouring
 // threads touch neighbouring columns (coalesced stores, no shared-memory bank conflicts). K is
 // walked BK = 16 at a time: the workgroup stages a 64 x 16 slice of x and a 16 x 64 slice of w in
 // shared memory, then every thread does its 16 x 4 x 4 multiply-adds from there. Each staged
@@ -30,9 +30,28 @@ const BN: u32 = TS * R;       // columns of out per workgroup
 const BK: u32 = 16u;          // k values staged per step
 const THREADS: u32 = TS * TS;
 
-// xs[k][row] (transposed, so the inner loop reads xs[k][ty + 16 r]) and ws[k][col].
-var<workgroup> xs: array<array<f32, BM>, BK>;
-var<workgroup> ws: array<array<f32, BN>, BK>;
+// The staged slices, packed so one vec4 load gives a thread its 4 values for one k:
+// xs[k][j] = x rows j, j + 16, j + 32, j + 48 (of this tile) at k, and
+// ws[k][j] = w columns j, j + 16, j + 32, j + 48 at k.
+var<workgroup> xs: array<array<vec4<f32>, TS>, BK>;
+var<workgroup> ws: array<array<vec4<f32>, TS>, BK>;
+
+// Row `i` of out, columns o, o + 16, o + 32, o + 48, from one accumulator.
+fn store_row(i: u32, o: u32, acc: vec4<f32>) {
+    if (i >= params.t) {
+        return;
+    }
+    for (var c = 0u; c < R; c++) {
+        let col = o + TS * c;
+        if (col < params.n_out) {
+            var v = acc[c];
+            if (params.has_bias != 0u) {
+                v += b[col];
+            }
+            out[i * params.n_out + col] = v;
+        }
+    }
+}
 
 @compute @workgroup_size(16, 16)
 fn main(
@@ -45,7 +64,12 @@ fn main(
     let row0 = wg.y * BM;
     let col0 = wg.x * BN;
 
-    var acc: array<array<f32, R>, R>;  // zero-initialised
+    // acc_r holds row ty + 16 r, columns tx + 16 c in lane c. Four named vectors, not an array:
+    // Mesa keeps a loop-indexed private array out of registers, which costs ~12x (D47).
+    var acc0 = vec4(0.0);
+    var acc1 = vec4(0.0);
+    var acc2 = vec4(0.0);
+    var acc3 = vec4(0.0);
     for (var k0 = 0u; k0 < params.n_in; k0 += BK) {
         // Stage the slices: BM * BK = BK * BN = 1024 values each, 4 per thread. Consecutive
         // threads load consecutive addresses (a 16-float run of an x row, a 64-float run of a w
@@ -61,7 +85,7 @@ fn main(
             if (gr < params.t && gk < params.n_in) {
                 v = x[gr * params.n_in + gk];
             }
-            xs[k][r] = v;
+            xs[k][r % TS][r / TS] = v;
         }
         for (var q = 0u; q < BK * BN / THREADS; q++) {
             let e = l + q * THREADS;
@@ -73,7 +97,7 @@ fn main(
             if (gk < params.n_in && gc < params.n_out) {
                 v = w[gk * params.n_out + gc];
             }
-            ws[k][c] = v;
+            ws[k][c % TS][c / TS] = v;
         }
         // The stores above must land before any thread reads the slices.
         workgroupBarrier();
@@ -82,34 +106,21 @@ fn main(
         // matvec's sequence (D46).
         let steps = min(BK, params.n_in - k0);
         for (var k = 0u; k < steps; k++) {
-            var a: array<f32, R>;
-            var bv: array<f32, R>;
-            for (var r = 0u; r < R; r++) {
-                a[r] = xs[k][ty + TS * r];
-                bv[r] = ws[k][tx + TS * r];
-            }
-            for (var r = 0u; r < R; r++) {
-                for (var c = 0u; c < R; c++) {
-                    acc[r][c] = fma(a[r], bv[c], acc[r][c]);
-                }
-            }
+            let a = xs[k][ty];
+            let bv = ws[k][tx];
+            acc0 = fma(vec4(a.x), bv, acc0);
+            acc1 = fma(vec4(a.y), bv, acc1);
+            acc2 = fma(vec4(a.z), bv, acc2);
+            acc3 = fma(vec4(a.w), bv, acc3);
         }
         // Every thread must finish reading this step's slices before the next step overwrites
         // them.
         workgroupBarrier();
     }
 
-    for (var r = 0u; r < R; r++) {
-        let i = row0 + ty + TS * r;
-        for (var c = 0u; c < R; c++) {
-            let o = col0 + tx + TS * c;
-            if (i < params.t && o < params.n_out) {
-                var v = acc[r][c];
-                if (params.has_bias != 0u) {
-                    v += b[o];
-                }
-                out[i * params.n_out + o] = v;
-            }
-        }
-    }
+    let o = col0 + tx;
+    store_row(row0 + ty, o, acc0);
+    store_row(row0 + ty + TS, o, acc1);
+    store_row(row0 + ty + 2u * TS, o, acc2);
+    store_row(row0 + ty + 3u * TS, o, acc3);
 }

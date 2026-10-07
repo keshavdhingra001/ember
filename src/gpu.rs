@@ -39,10 +39,12 @@ pub(crate) struct Kernels {
     pub linear_naive: Kernel,
     pub matmul: Kernel,
     pub matvec: Kernel,
+    pub matvec_wide: Kernel,
     pub attention: Kernel,
     pub kv_write: Kernel,
     pub copy: Kernel,
     pub fma_peak: Kernel,
+    pub read_peak: Kernel,
 }
 
 impl Gpu {
@@ -78,7 +80,7 @@ impl Gpu {
             .map_err(|e| Error::Device(e.to_string()))?;
         let limits = device.limits();
         let features = device.features();
-        let k = |name, src| compute_pipeline(&device, name, src);
+        let k = |name, src| compute_pipeline(&device, name, src, &[]);
         // The row kernels share reduce.wgsl's trees: same source text, prepended.
         let with_reduce = |src: &str| [include_str!("shaders/reduce.wgsl"), src].concat();
         let kernels = Kernels {
@@ -96,6 +98,12 @@ impl Gpu {
             linear_naive: k("linear_naive", include_str!("shaders/linear_naive.wgsl")),
             matmul: k("matmul", include_str!("shaders/matmul.wgsl")),
             matvec: k("matvec", include_str!("shaders/matvec.wgsl")),
+            matvec_wide: compute_pipeline(
+                &device,
+                "matvec_wide",
+                include_str!("shaders/matvec.wgsl"),
+                &[("LOOKAHEAD", 0.0)],
+            ),
             attention: k(
                 "attention",
                 &with_reduce(include_str!("shaders/attention.wgsl")),
@@ -103,6 +111,7 @@ impl Gpu {
             kv_write: k("kv_write", include_str!("shaders/kv_write.wgsl")),
             copy: k("copy", include_str!("shaders/copy.wgsl")),
             fma_peak: k("fma_peak", include_str!("shaders/fma_peak.wgsl")),
+            read_peak: k("read_peak", include_str!("shaders/read_peak.wgsl")),
         };
         Ok(Gpu {
             device,
@@ -290,7 +299,13 @@ fn padded_bytes(data: &[f32]) -> &[u8] {
     bytemuck::cast_slice(if data.is_empty() { &ZERO } else { data })
 }
 
-fn compute_pipeline(device: &wgpu::Device, label: &'static str, wgsl: &str) -> Kernel {
+/// Compile `wgsl`'s `main` with values for its `override` constants (D48).
+fn compute_pipeline(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    constants: &[(&str, f64)],
+) -> Kernel {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -300,7 +315,10 @@ fn compute_pipeline(device: &wgpu::Device, label: &'static str, wgsl: &str) -> K
         layout: None,
         module: &module,
         entry_point: Some("main"),
-        compilation_options: Default::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants,
+            ..Default::default()
+        },
         cache: None,
     });
     Kernel {

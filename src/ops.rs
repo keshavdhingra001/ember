@@ -186,6 +186,11 @@ const MATMUL_TILE: usize = 64;
 /// Outputs per `matvec` workgroup. Must match `WG` in matvec.wgsl.
 const MATVEC_WG: usize = 256;
 
+/// From this many outputs on, the matvec runs without lookahead (D48): measured on GPT-2's
+/// shapes, lookahead wins at 768-3072 outputs and loses at the LM head's 50257. The boundary
+/// between them is not measured.
+const MATVEC_WIDE: usize = 16384;
+
 /// `y = x @ w + b`: `x: [T, in]`, `w: [in, out]` (the GPU layout, D45), `b: [out]` or none.
 /// One row (a decode step) goes to the matrix-vector kernel, more rows to the tiled matmul
 /// (D43, D44). Both compute each output with the same serial sequence of fused multiply-adds,
@@ -195,7 +200,12 @@ pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) ->
     let dims = (t, n_in, n_out);
     if t == 1 {
         let groups = (n_out.div_ceil(MATVEC_WG), 1);
-        linear_dispatch(gpu, &gpu.kernels.matvec, x, w, b, dims, groups)
+        let kernel = if n_out >= MATVEC_WIDE {
+            &gpu.kernels.matvec_wide
+        } else {
+            &gpu.kernels.matvec
+        };
+        linear_dispatch(gpu, kernel, x, w, b, dims, groups)
     } else {
         let groups = (n_out.div_ceil(MATMUL_TILE), t.div_ceil(MATMUL_TILE));
         linear_dispatch(gpu, &gpu.kernels.matmul, x, w, b, dims, groups)
@@ -417,8 +427,8 @@ pub fn copy_with_max_groups(gpu: &Gpu, x: &GpuTensor, max_groups: u32) -> Result
     Ok(out)
 }
 
-/// Fused multiply-adds per invocation and step of `fma_peak`. Must match `CHAINS` in the shader.
-pub const FMA_PEAK_CHAINS: usize = 8;
+/// Fused multiply-adds per invocation and step of `fma_peak`: its 8 vec4 chains.
+pub const FMA_PEAK_CHAINS: usize = 32;
 
 /// The compute-roof probe (D47): `groups` workgroups of 256 invocations each run
 /// `FMA_PEAK_CHAINS` independent fma chains for `iters` steps, which is
@@ -435,6 +445,32 @@ pub fn fma_peak(gpu: &Gpu, groups: u32, iters: u32) -> Result<GpuTensor> {
         &gpu.kernels.fma_peak,
         &[&out.buffer, &params],
         (groups, 1, 1),
+    );
+    Ok(out)
+}
+
+/// Workgroups `read_peak` launches: enough to fill the GPU, few enough that its one store per
+/// invocation is small next to what it reads.
+const READ_PEAK_GROUPS: usize = 1024;
+
+/// The read-bandwidth probe (D47): per-invocation sums over `x`, read once, 16 bytes per load.
+/// The length must be a multiple of 4. Like `copy`, it exists to be timed.
+pub fn read_peak(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
+    if x.is_empty() || !x.len().is_multiple_of(4) {
+        return Err(Error::Shape(format!(
+            "read_peak: {} elements aren't one or more whole vec4s",
+            x.len()
+        )));
+    }
+    let groups = READ_PEAK_GROUPS
+        .min(x.len().div_ceil(4 * ELEMENTWISE_WG as usize))
+        .max(1);
+    let out = gpu.alloc(&[groups * ELEMENTWISE_WG as usize * 4]);
+    let params = gpu.uniform(&Params4::new(len_u32(x.len() / 4)?, 0, 0, 0));
+    gpu.dispatch(
+        &gpu.kernels.read_peak,
+        &[&x.buffer, &out.buffer, &params],
+        (groups as u32, 1, 1),
     );
     Ok(out)
 }
