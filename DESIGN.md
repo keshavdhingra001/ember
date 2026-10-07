@@ -706,7 +706,7 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
   configurations and the tiled matmul. Without it, a wrong chunk size in both kernels would pass
   the matmul-vs-matvec bitwise test and the tolerance.
 
-### D55: Small-T prefill is decided after measuring D51–D52 (measured; decision pending)
+### D55: Small-T prefill is decided after measuring D51–D52 (decided: D57)
 - **What:** measure first, then choose between split-K in the matmul for small T and a narrower
   tile. Expected gain from D51–D52 (an estimate, to be measured): attn_out + fc_out from 9.6 to
   ~5.5 ms per step, decode ~28.5 → ~24 ms (~41 tokens/s).
@@ -769,4 +769,37 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
   The gain is smaller than D55's estimate (attn_out + fc_out 9.6 → 5.5 ms, step ~24 ms):
   the split matrices went from ~9.5 to ~6.1 ms in `ember matmul`, but less inside the model.
   The wall-clock tokens/s needs a rerun on a quiet machine before it goes in the README.
+
+### D57: Up to 8 rows run a multi-row matvec
+- **What:** `matvec_rows.wgsl` is the matvec with up to 8 rows per thread: one partial per row
+  in two vec4s, each weight read once and applied to every row. Same layout, slices, lookahead
+  and dispatch rule as D56 (`matvec_rows_split` / `matvec_rows` / `matvec_rows_wide`).
+  `ops::linear`: T = 1 matvec, 2–8 `matvec_rows`, more the tiled matmul. x is staged in windows
+  of 64 k values per chunk (a whole round for 8 rows would be 32 KiB of shared memory).
+- **Alternatives (owner's choice, 2026-10-07):** split-K in the tiled matmul for small T (a
+  scratch buffer and a second pass); a narrower tile.
+- **Why:** a 7-row prefill is memory-bound like decode: 7 rows × 2 flops per weight is far below
+  what the GPU can compute while one weight arrives. The tiled matmul ran it on `n_out / 64`
+  workgroups (12 for 768 outputs). Each row is still D51's chunked sum, so bits don't depend
+  on the batch (tested on sub-batches of 1, 2 and 8 rows against a 70-row matmul batch).
+- **Measured (`ember profile`, 7-token prompt, GPU time, D56 binary and D57 alternately twice;
+  CPU loaded by another job):** the prefill's block matrices 46.5, 46.3 ms (`matmul` ×48) →
+  22.2, 26.9 ms (`matvec_rows` + `matvec_rows_split`); all prefill kernels 53.6, 53.0 → 28.5,
+  37.0 ms. The second run was noisier (its wall clock had 17.8 ms outside kernels against
+  ~8 normally). `ember matmul`'s T = 7 row now times `matvec_rows` too, but it repeats one
+  matrix, which stays in the last-level cache (D50), so the model-level number is the one to
+  quote.
+- **The 8-row limit is not measured:** at some T the tiled matmul wins again (compute starts to
+  matter, and 8 accumulators per thread is already 2 vec4s). Not swept.
+- **Mutation pass (19 mutants in matvec_rows.wgsl and the dispatch; `--test gpu_ops --test
+  gpt2_gpu`): 15 caught**, including all three barrier removals, a wrong row / k mapping in the
+  staging, a swapped lookahead weight, a wrong half of the accumulators, and a row limit raised
+  to 16 (caught by the GPT-2 tests, whose uncached recompute runs 9–16-row batches). The 4
+  survivors:
+  - Writing row t (one past the end): this driver drops out-of-bounds writes; the check stays
+    (D50).
+  - Staging rows past t: read out of bounds, never stored. Equivalent; the check stays.
+  - No window bound inside a partial last chunk: the extra k values have x staged as 0, and
+    `fma(0, w, p) = p` for any finite w. Equivalent; the bound only skips work (like D46).
+  - Adding the empty chunks of a partial last round: +0 each. Equivalent (D56).
 
