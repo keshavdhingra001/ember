@@ -668,7 +668,7 @@ Model level: `ember profile` and `ember bench -n 32` on the 7-token prompt, the 
     also allows them to land elsewhere in the same buffer, so the check stays (like D22's gelu
     clamp).
 
-## M6 follow-up: split-K (approved 2026-10-07, not built yet)
+## M6 follow-up: split-K (approved and built 2026-10-07)
 
 D50 left two gaps with one cause, too few threads: the 768-output matvecs run at 50% of the
 read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
@@ -682,7 +682,7 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
 - **Why:** it gives the matvec K/256 times more threads and keeps D33's bitwise decode check,
   because both kernels still run one identical sequence of operations per output.
 
-### D52: Matvec: 64 outputs × 4 K slices per workgroup
+### D52: Matvec: 64 outputs × 4 K slices per workgroup (amended by D56)
 - **What:** 256 threads = 64 consecutive outputs × 4 slices. Slice threads compute the partials
   of their chunks; the workgroup adds them in chunk order through shared memory, in rounds of 4
   chunks, so any K works. `attn_out` goes from 768 to 2304 threads, `fc_out` to 9216.
@@ -694,8 +694,79 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
 
 ### D54: The CPU oracle stays serial
 - **What:** the tolerance stays 1e-5, and the measured error under the chunked order is recorded.
+- **Measured (`linear_matches_cpu`, random x in ±1, w in ±0.1):** the worst absolute error grew
+  from 2.9e-6 to 1.24e-5 at n_in = 3072 (LM head shape: 1.7e-6 → 5.0e-6). Against the
+  tolerance `1e-5 + 1e-5 · |want|`, the worst element uses 69% of it (before: at most 29%, since
+  2.9e-6 < 0.29 · 1e-5). What grew is the distance between two orders of the same sum, not
+  necessarily the error against the true value: a serial sum's error bound grows with n, a
+  chunked sum's with 256 + n / 256, so the CPU's order is usually the less accurate one (not
+  measured against float64 here).
+- **Also tested:** `linear_is_bitwise_the_chunked_sum` writes D51 out on the CPU with
+  `f32::mul_add` and requires the GPU's bits to match exactly, for all three matvec
+  configurations and the tiled matmul. Without it, a wrong chunk size in both kernels would pass
+  the matmul-vs-matvec bitwise test and the tolerance.
 
-### D55: Small-T prefill is decided after measuring D51–D52
+### D55: Small-T prefill is decided after measuring D51–D52 (measured; decision pending)
 - **What:** measure first, then choose between split-K in the matmul for small T and a narrower
   tile. Expected gain from D51–D52 (an estimate, to be measured): attn_out + fc_out from 9.6 to
   ~5.5 ms per step, decode ~28.5 → ~24 ms (~41 tokens/s).
+
+### D56: The matvec splits K only up to 1024 outputs
+- **What:** `matvec.wgsl` takes the slice count as an override constant (`SLICES`, like
+  `LOOKAHEAD`, D48) and is compiled three times: `matvec_split` (4 slices, lookahead) up to 1024
+  outputs, `matvec` (1 slice, lookahead) below 16384, `matvec_wide` (1 slice, none) above. The
+  slice count only decides which thread computes a chunk's partial, never the order the partials
+  are added in, so all three give the same bits (tested).
+- **Alternatives (owner's choice, 2026-10-07):** D52 as approved (4 slices everywhere); the best
+  variant per matrix from the sweep below (overfits three noisy runs).
+- **Why:** D52 as approved made the decode step *slower* (22.7 → 25.5 ms). Splitting K helps the
+  768-output matrices, which lacked threads, and hurts the wide ones, which didn't: a slice's 64
+  threads read 256-byte runs of a row of `w` instead of 1 KiB. That explanation fits the numbers
+  but isn't verified.
+- **Sweep (2026-10-07, `ember matmul` decode table, GPU ms per step's matrices, median of 3 runs
+  alternated with the pre-split binary; CPU busy with another job, GPU idle):**
+
+  | Variant (slices, lookahead) | qkv | attn_out | fc | fc_out | lm_head | Step |
+  |---|---|---|---|---|---|---|
+  | Before (serial sum, D48) | 3.32 | 1.83 | 3.97 | 7.65 | 5.94 | 22.70 |
+  | 1, on | 3.17 | 1.80 | 4.21 | 7.35 | 10.16 | 26.69 |
+  | 1, off | 4.91 | 4.49 | 6.09 | 18.26 | 5.20 | 38.94 |
+  | 2, on | 3.69 | 1.35 | 4.96 | 4.86 | 9.83 | 24.70 |
+  | 2, off | 3.61 | 3.01 | 5.12 | 9.28 | 6.60 | 27.62 |
+  | 4, on (D52) | 3.84 | 1.23 | 4.99 | 5.27 | 10.16 | 25.48 |
+  | 4, off | 2.81 | 1.76 | 4.76 | 5.72 | 8.08 | 23.13 |
+
+  Single runs vary by up to ~15% per matrix (the read roof itself measured 28.7–30.3 GB/s), so
+  differences under that are noise. The rule's estimate from this table: 3.17 + 1.23 + 4.21 +
+  5.27 + 5.20 = 19.1 ms. The 1024 boundary sits between the measured 768 and 2304; it isn't
+  itself measured.
+- **Mutation pass (20 mutants in matvec.wgsl, matmul.wgsl and the dispatch in ops.rs; `--test
+  gpu_ops --test gpt2_gpu`): 17 caught.** Both barrier removals, a wrong chunk size in either
+  kernel, a reversed combine order, a swapped lookahead pair, a dropped final fold, and a
+  workgroup count that doesn't match the slice count were all caught. The 3 survivors:
+  - Staging `x` with `<=` n_in: one extra value is staged and never read, and the read itself
+    is out of bounds, which WebGPU clamps. Equivalent; the check stays (no out-of-bounds reads).
+  - A partial last chunk's length taken from the round start instead of the chunk start: slices
+    past n_in read `w` out of bounds, this driver returns 0, and `fma(x, 0, p) = p`. Another
+    driver may return a clamped in-bounds value instead, so the check stays (like D50's row
+    check). Not observable here.
+  - Adding the empty chunks of a partial last round: each adds +0, and the total is never -0.
+    Equivalent, as the shader comment says.
+- **Model level (2026-10-07):** the pre-split binary (`06f483c`) and D56 (`5a59bc7`), run
+  alternately twice: `ember profile`, `ember bench -n 32`, `ember matmul` on the 7-token prompt.
+  The GPU was idle but the CPU was not: another project's test loop ran the whole time (load
+  average 5–12). GPU times come from timestamp queries and hold up; wall-clock times don't.
+
+  | | Before (2 runs) | After (2 runs) | |
+  |---|---|---|---|
+  | Decode step, kernels (`profile`) | 24.6, 26.7 ms | 22.1, 22.4 ms | −10 to −16% |
+  | Block matrices per decode step (`profile`) | 17.5 ms (`matvec` ×48) | 15.1 ms (`matvec` 7.9 + `matvec_split` 7.2) | |
+  | One step's matrices (`matmul`) | 23.3, 23.7 ms | 19.6, 21.1 ms | |
+  | Decode weight bandwidth, kernels | 20.1, 18.5 GB/s | 22.4, 22.1 GB/s | |
+  | Prefill, kernels | 53.9 ms | 53.9 ms | unchanged (the matmul's extra fold costs nothing visible) |
+  | Decode, `bench` (wall, CPU loaded) | 24.1, 30.8 tokens/s | 37.4, 35.6 tokens/s | not a valid comparison |
+
+  The gain is smaller than D55's estimate (attn_out + fc_out 9.6 → 5.5 ms, step ~24 ms):
+  the split matrices went from ~9.5 to ~6.1 ms in `ember matmul`, but less inside the model.
+  The wall-clock tokens/s needs a rerun on a quiet machine before it goes in the README.
+
