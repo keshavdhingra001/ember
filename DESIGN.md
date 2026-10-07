@@ -406,3 +406,46 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
   f32 weights once, so 50.6 ms means ~10 GB/s effective. This laptop's LPDDR4x peak is around
   50–68 GB/s (unmeasured here; M6 measures the roofline), so naive decode reaches roughly a
   fifth of it. That's the gap the uncoalesced matrix-vector reads (D19) leave for M6.
+
+## M5: Measurement
+
+### D36: GPU time comes from timestamp queries
+- **What:** with `Features::TIMESTAMP_QUERY` (requested when the adapter has it), every compute
+  pass gets `timestamp_writes` at its beginning and end. Each dispatch is its own pass (D25), so
+  each pair brackets exactly one kernel. The query set is resolved into a buffer, read back, and
+  `(end - begin) × queue.get_timestamp_period()` gives nanoseconds. On the Iris Xe / Mesa 26.2.2
+  one tick is 52.08 ns (a 19.2 MHz counter).
+- **Alternatives:** wall clock around each op with a blocking `poll`.
+- **Why:** the wall clock measures CPU + driver + GPU and, with a wait after every op, also
+  destroys the CPU/GPU overlap it is trying to measure. Timestamps are written by the GPU
+  itself. Buffer copies (`ops::row`, readback) aren't passes and aren't timed; they show up in
+  the gap between kernel time and step wall time (D38).
+
+### D37: The profiler is opt-in and lives in `src/profile.rs`
+- **What:** `Gpu` holds an optional profiler behind a `Mutex`. `gpu.profile_start()` turns it on,
+  every `dispatch` then records its kernel's name and two query slots, and
+  `gpu.profile_finish()` resolves and returns `(kernel, ns)` per dispatch. Off (the default),
+  `dispatch` creates no queries.
+- **Why:** nothing the engine computes may depend on timing (D4), so the clock is read only by
+  the profiler and the CLI. A test checks that logits are bitwise identical with profiling on.
+
+### D38: Report: per-kernel table plus wall clock
+- **What:** `ember profile` prints, for the prefill and for one decode step, each kernel's call
+  count, GPU ms and share of the step, the kernels' total, and the step's wall-clock time. The
+  difference is everything that isn't a kernel: submits, buffer allocation, copies, readback,
+  CPU work.
+
+### D39: Method: 1 warm-up, median of 5
+- **What:** each kernel's per-step time is the median over 5 measured runs after 1 warm-up; the
+  same for wall clock. Device, driver, prompt and lengths are printed with every table.
+
+### D40: Context sweep
+- **What:** decode ms/token measured at positions ≈ 8, 128, 512 and 1000 (the cache is filled by
+  a prefill of that length first), with the attention kernel's share at each.
+- **Why:** attention is O(t) per step while the matmuls are fixed; the sweep shows where
+  attention starts to matter.
+
+### D41: Measured bandwidth roofline
+- **What:** a `copy` kernel (vec4 loads and stores, grid-stride) moves a 256 MiB buffer; bytes
+  read + written over its timestamped GPU time gives achievable GB/s. Decode's weight bytes over
+  its kernel time is then compared with that, not with a datasheet number.

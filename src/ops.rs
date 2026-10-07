@@ -2,7 +2,7 @@
 //! Each one has a CPU twin in `cpu.rs` that it is tested against.
 
 use crate::error::{Error, Result};
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, Kernel};
 use crate::shape;
 use crate::tensor::GpuTensor;
 
@@ -62,7 +62,7 @@ impl Params4 {
 /// the last binding, whose first field is the element count.
 fn elementwise(
     gpu: &Gpu,
-    pipeline: &wgpu::ComputePipeline,
+    kernel: &Kernel,
     buffers: &[&wgpu::Buffer],
     params: Params4,
     max_groups: u32,
@@ -71,7 +71,7 @@ fn elementwise(
     let mut bindings = buffers.to_vec();
     bindings.push(&uniform);
     let groups = elementwise_groups(params.a as usize, max_groups);
-    gpu.dispatch(pipeline, &bindings, (groups, 1, 1));
+    gpu.dispatch(kernel, &bindings, (groups, 1, 1));
 }
 
 /// Elementwise GPT-2 GELU (tanh approximation).

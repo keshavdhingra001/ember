@@ -1,10 +1,11 @@
 //! The GPU context: one headless device and queue (D6), compiled kernels, upload and readback.
 
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 
 use wgpu::util::DeviceExt;
 
 use crate::error::{Error, Result};
+use crate::profile::{KernelTime, Profiler};
 use crate::tensor::{GpuTensor, Tensor, numel};
 
 pub struct Gpu {
@@ -12,20 +13,32 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
+    /// Optional features we asked for and got. Only `TIMESTAMP_QUERY` so far (the profiler, D36);
+    /// nothing in the engine's results depends on it.
+    pub features: wgpu::Features,
     pub(crate) kernels: Kernels,
+    /// `Some` while profiling (D37). A `Mutex` because `Gpu` is shared (`&Gpu`, across test
+    /// threads); uncontended, it costs nanoseconds per dispatch next to microseconds of work.
+    profiler: Mutex<Option<Profiler>>,
+}
+
+/// A compiled pipeline and the name the profiler reports it under.
+pub(crate) struct Kernel {
+    pub name: &'static str,
+    pub pipeline: wgpu::ComputePipeline,
 }
 
 /// Every compute pipeline, compiled once at startup. Compiling WGSL to the driver's ISA takes
 /// milliseconds; doing it per call would dwarf the kernels themselves.
 pub(crate) struct Kernels {
-    pub add: wgpu::ComputePipeline,
-    pub gelu: wgpu::ComputePipeline,
-    pub embed: wgpu::ComputePipeline,
-    pub softmax: wgpu::ComputePipeline,
-    pub layer_norm: wgpu::ComputePipeline,
-    pub linear: wgpu::ComputePipeline,
-    pub attention: wgpu::ComputePipeline,
-    pub kv_write: wgpu::ComputePipeline,
+    pub add: Kernel,
+    pub gelu: Kernel,
+    pub embed: Kernel,
+    pub softmax: Kernel,
+    pub layer_norm: Kernel,
+    pub linear: Kernel,
+    pub attention: Kernel,
+    pub kv_write: Kernel,
 }
 
 impl Gpu {
@@ -53,11 +66,14 @@ impl Gpu {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ember"),
                 required_limits: adapter.limits(),
+                // Requested when the adapter has it, so profiling is possible; not required.
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 ..Default::default()
             })
             .await
             .map_err(|e| Error::Device(e.to_string()))?;
         let limits = device.limits();
+        let features = device.features();
         let k = |name, src| compute_pipeline(&device, name, src);
         // The row kernels share reduce.wgsl's trees: same source text, prepended.
         let with_reduce = |src: &str| [include_str!("shaders/reduce.wgsl"), src].concat();
@@ -85,7 +101,9 @@ impl Gpu {
             queue,
             info,
             limits,
+            features,
             kernels,
+            profiler: Mutex::new(None),
         })
     }
 
@@ -181,11 +199,33 @@ impl Gpu {
         self.queue.submit([enc.finish()]);
     }
 
+    /// Start timing every dispatch (D36, D37), discarding anything recorded but not finished.
+    /// Each window gets a fresh query set (two small buffers): negligible next to a model step.
+    /// Fails if the device has no `TIMESTAMP_QUERY`.
+    pub fn profile_start(&self) -> Result<()> {
+        if !self.features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return Err(Error::Device(
+                "this adapter has no TIMESTAMP_QUERY; profiling needs it".into(),
+            ));
+        }
+        *self.profiler.lock().unwrap() = Some(Profiler::new(&self.device));
+        Ok(())
+    }
+
+    /// Stop timing and return each dispatch since `profile_start`, in order. Waits for the GPU.
+    pub fn profile_finish(&self) -> Result<Vec<KernelTime>> {
+        let profiler = self.profiler.lock().unwrap().take();
+        match profiler {
+            Some(p) => p.finish(&self.device, &self.queue),
+            None => Err(Error::Input("profile_finish without profile_start".into())),
+        }
+    }
+
     /// Record and submit one compute dispatch of `(x, y, z)` workgroups. Bindings are buffers
     /// in binding order.
     pub(crate) fn dispatch(
         &self,
-        pipeline: &wgpu::ComputePipeline,
+        kernel: &Kernel,
         bindings: &[&wgpu::Buffer],
         (x, y, z): (u32, u32, u32),
     ) {
@@ -199,13 +239,17 @@ impl Gpu {
             .collect();
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &pipeline.get_bind_group_layout(0),
+            layout: &kernel.pipeline.get_bind_group_layout(0),
             entries: &entries,
         });
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(pipeline);
+            let mut profiler = self.profiler.lock().unwrap();
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(kernel.name),
+                timestamp_writes: profiler.as_mut().and_then(|p| p.next(kernel.name)),
+            });
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(x, y, z);
         }
@@ -238,17 +282,21 @@ fn padded_bytes(data: &[f32]) -> &[u8] {
     bytemuck::cast_slice(if data.is_empty() { &ZERO } else { data })
 }
 
-fn compute_pipeline(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ComputePipeline {
+fn compute_pipeline(device: &wgpu::Device, label: &'static str, wgsl: &str) -> Kernel {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl.into()),
     });
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
         layout: None,
         module: &module,
         entry_point: Some("main"),
         compilation_options: Default::default(),
         cache: None,
-    })
+    });
+    Kernel {
+        name: label,
+        pipeline,
+    }
 }

@@ -6,6 +6,7 @@ pub mod error;
 pub mod gpt2;
 pub mod gpu;
 pub mod ops;
+pub mod profile;
 pub mod rng;
 pub mod safetensors;
 mod shape;

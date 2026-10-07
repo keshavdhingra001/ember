@@ -59,6 +59,14 @@ fn info() -> Result<(), Box<dyn std::error::Error>> {
         l.max_compute_invocations_per_workgroup,
         l.max_compute_workgroup_storage_size
     );
+    if gpu.features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        println!(
+            "timestamps   yes, one tick = {} ns",
+            gpu.queue.get_timestamp_period()
+        );
+    } else {
+        println!("timestamps   no (TIMESTAMP_QUERY unsupported: `ember profile` can't run)");
+    }
     Ok(())
 }
 
