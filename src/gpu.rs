@@ -243,15 +243,19 @@ impl Gpu {
         self.limits.max_compute_workgroups_per_dimension
     }
 
-    /// An uninitialised-by-us (wgpu zero-fills it) tensor for a kernel to write into.
+    /// A zero-filled tensor for a kernel to write into.
     pub fn alloc(&self, shape: &[usize]) -> GpuTensor {
         self.count();
+        // Created mapped, so the zeros are written now and wgpu has nothing left to initialize
+        // lazily: its lazy zero-init raced with other threads' work and left another buffer's
+        // data in outputs (D65, tests/concurrency.rs).
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: byte_size(numel(shape)),
             usage: TENSOR_USAGE,
-            mapped_at_creation: false,
+            mapped_at_creation: true,
         });
+        buffer.unmap();
         GpuTensor {
             shape: shape.to_vec(),
             buffer,

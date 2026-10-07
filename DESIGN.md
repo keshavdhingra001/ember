@@ -924,3 +924,21 @@ position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
   view must survive. Workspace path vs op-by-op path bitwise. Attention at chunk boundaries
   (63, 64, 65, 1023, 1024 keys) and beyond 1024 against the CPU at the unchanged 1e-5. The
   creation counter is zero for a steady-state decode step.
+
+### D65: `Gpu::alloc` creates buffers initialized (approved 2026-10-08)
+- **Problem:** with several threads on one `Gpu` (the test binaries), a kernel's output buffer
+  sometimes held another buffer's data: `gpu_ops` failed 4 of 20 runs, each time in a different
+  test, with an output whose first few floats were right. Present since at least M4 (a stress
+  test fails at `727daab`); §3's three new tests added enough parallel traffic to show it.
+  Narrowed down with `tests/concurrency.rs` (8 threads × 300 `add`s): 1–5 bad outputs per run;
+  none on one thread (0 of 7200), none for upload + readback alone, none when the output was
+  initialized before the kernel. So the race is in wgpu 30.0.1's lazy zero-init of new buffers
+  (or below it, Mesa ANV), not in ember's recording or readback. The engine itself runs on one
+  thread, which never showed it.
+- **What:** `alloc` creates its buffer `mapped_at_creation` and unmaps it at once: the zeros
+  are written then, and wgpu has nothing to initialize lazily. Staging buffers keep lazy init
+  (readback alone never failed).
+- **Alternatives:** run GPU tests on one thread (hides a real race); report upstream only.
+- **Result:** the stress test 0 bad in 6 runs, `gpu_ops` 0 failures in 20 runs. Creation counts
+  (D60) are unchanged; the cached decode step allocates nothing, so it can't be slower. Worth
+  an upstream report with the stress test as the repro.
