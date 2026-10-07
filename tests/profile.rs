@@ -64,7 +64,7 @@ fn one_label_and_time_per_dispatch_in_order() {
     let mut want = vec!["embed"];
     want.extend(block);
     want.extend(block);
-    want.extend(["layer_norm", "matvec"]); // ln_f, then the LM head on the last row (D44)
+    want.extend(["layer_norm", "matvec_split"]); // ln_f, then the 37-wide LM head on the last row (D44, D56)
     let got: Vec<&str> = times.iter().map(|t| t.kernel).collect();
     assert_eq!(got, want);
     for t in &times {

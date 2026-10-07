@@ -183,11 +183,17 @@ const NAIVE_TILE: usize = 16;
 /// Rows and columns of the output per `matmul` workgroup. Must match `BM` and `BN` in matmul.wgsl.
 const MATMUL_TILE: usize = 64;
 
-/// Outputs per `matvec` workgroup. Must match `OUTS` in matvec.wgsl.
-const MATVEC_OUTS: usize = 64;
+/// Threads per `matvec` workgroup. Must match `WG` in matvec.wgsl.
+const MATVEC_WG: usize = 256;
+
+/// Up to this many outputs, the matvec splits K four ways (D56): 768 outputs are 768 threads
+/// without the split, too few to keep the memory busy. Wider matrices have enough threads, and
+/// the split's shorter runs per row cost more than it saves. Measured at 768 (split wins) and
+/// 2304 (split loses); the boundary between them is not measured.
+const MATVEC_SPLIT: usize = 1024;
 
 /// From this many outputs on, the matvec runs without lookahead (D48): measured on GPT-2's
-/// shapes, lookahead wins at 768-3072 outputs and loses at the LM head's 50257. The boundary
+/// shapes, lookahead wins at 2304-3072 outputs and loses at the LM head's 50257. The boundary
 /// between them is not measured.
 const MATVEC_WIDE: usize = 16384;
 
@@ -199,12 +205,15 @@ pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) ->
     let (t, n_in, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
     let dims = (t, n_in, n_out);
     if t == 1 {
-        let groups = (n_out.div_ceil(MATVEC_OUTS), 1);
-        let kernel = if n_out >= MATVEC_WIDE {
-            &gpu.kernels.matvec_wide
+        let (kernel, slices) = if n_out <= MATVEC_SPLIT {
+            (&gpu.kernels.matvec_split, 4)
+        } else if n_out < MATVEC_WIDE {
+            (&gpu.kernels.matvec, 1)
         } else {
-            &gpu.kernels.matvec
+            (&gpu.kernels.matvec_wide, 1)
         };
+        // Must match the shader's outs = WG / SLICES.
+        let groups = (n_out.div_ceil(MATVEC_WG / slices), 1);
         linear_dispatch(gpu, kernel, x, w, b, dims, groups)
     } else {
         let groups = (n_out.div_ceil(MATMUL_TILE), t.div_ceil(MATMUL_TILE));

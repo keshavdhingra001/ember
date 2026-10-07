@@ -6,17 +6,22 @@
 // order, then the bias. matmul.wgsl computes exactly the same operations in the same order, so
 // decode equals the prefill row bit for bit (D46, D33).
 //
-// Layout (D52): a workgroup of 256 threads owns 64 consecutive outputs and splits K four ways.
-// Thread l computes output o = 64 * wg + l % 64 for slice s = l / 64. K is walked in rounds of
-// SLICES chunks: in each round slice s computes chunk 4 * round + s. That gives n_out * 4 threads
-// instead of n_out (768 -> 3072 for attn_out and fc_out), so more loads are in flight. At every k,
-// the 64 threads of a slice read 64 consecutive floats of row k of w (a 256-byte run).
-// All threads need the same x values, so a round's 1024 values of x are staged in shared memory.
+// Layout (D52, D56): a workgroup of 256 threads owns 256 / SLICES consecutive outputs and
+// splits K SLICES ways. Thread l computes output o = outs * wg + l % outs for slice
+// s = l / outs. K is walked in rounds of SLICES chunks: in each round slice s computes chunk
+// SLICES * round + s. With SLICES = 4 that gives n_out * 4 threads instead of n_out (768 -> 3072
+// for attn_out and fc_out), so more loads are in flight. At every k, the outs threads of a slice
+// read outs consecutive floats of row k of w: a 1 KiB run with one slice, 256 bytes with four,
+// which is why wide matrices, which have enough threads already, run with one. All threads need
+// the same x values, so a round's SLICES * 256 values of x are staged in shared memory.
+// The slice count changes which thread computes a partial, never the order they're added in,
+// so every configuration gives the same bits.
 //
-// Compiled twice (D48). With LOOKAHEAD, a thread issues 8 loads before the 8 fmas that use
-// them, so 8 loads are in flight per thread: that pays when there are few threads. Without it,
-// for the LM head: enough threads already, and the lookahead's extra registers cost more than
-// they save.
+// Compiled three times from this source (D48, D56): (SLICES, LOOKAHEAD) = (4, on) up to 1024
+// outputs, (1, on) below 16384, (1, off) above. With LOOKAHEAD, a thread issues 8 loads before
+// the 8 fmas that use them, so 8 loads are in flight per thread: that pays when there are few
+// threads. Without it, for the LM head: enough threads already, and the lookahead's extra
+// registers cost more than they save.
 
 struct Params {
     t: u32,  // always 1; the layout matches matmul's Params
@@ -31,35 +36,37 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-const OUTS: u32 = 64u;              // outputs per workgroup
-const SLICES: u32 = 4u;             // chunks computed side by side, one per slice
-const WG: u32 = OUTS * SLICES;
+const WG: u32 = 256u;
 const CHUNK: u32 = 256u;            // k values per chunk; matmul.wgsl must use the same (D51)
-const ROUND: u32 = SLICES * CHUNK;  // k values per round
+const MAX_SLICES: u32 = 4u;
 
 override LOOKAHEAD: bool = true;
+// Chunks computed side by side, one per slice: 1, 2 or 4 (at most MAX_SLICES, so xs fits).
+override SLICES: u32 = 4u;
 
-var<workgroup> xs: array<f32, ROUND>;
-// parts[s][j]: this round's partial of slice s for the workgroup's output j.
-var<workgroup> parts: array<array<f32, OUTS>, SLICES>;
+var<workgroup> xs: array<f32, MAX_SLICES * CHUNK>;
+// parts[s * outs + j]: this round's partial of slice s for the workgroup's output j.
+var<workgroup> parts: array<f32, WG>;
 
 @compute @workgroup_size(WG)
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let j = lid.x % OUTS;
-    let s = lid.x / OUTS;
-    let o = wg.x * OUTS + j;
+    let outs = WG / SLICES;  // outputs per workgroup
+    let round = SLICES * CHUNK;  // k values per round
+    let j = lid.x % outs;
+    let s = lid.x / outs;
+    let o = wg.x * outs + j;
     let n = params.n_out;
     // Threads past n_out can't return early: they still stage x and reach every barrier.
     let live = o < n;
     // The running total, kept by slice 0's thread for each output.
     var total = 0.0;
-    for (var r0 = 0u; r0 < params.n_in; r0 += ROUND) {
+    for (var r0 = 0u; r0 < params.n_in; r0 += round) {
         // Stage this round's x, 4 values per thread. The barrier at the end of the previous
         // round guarantees nobody still reads the previous round's values.
-        for (var q = 0u; q < ROUND / WG; q++) {
+        for (var q = 0u; q < round / WG; q++) {
             let i = lid.x + q * WG;
             if (r0 + i < params.n_in) {
                 xs[i] = x[r0 + i];
@@ -105,7 +112,7 @@ fn main(
                 p = fma(xs[xb + k], w[(c0 + k) * n + o], p);
             }
         }
-        parts[s][j] = p;
+        parts[s * outs + j] = p;
         // Every partial must be written before slice 0 adds them. This barrier also ends every
         // read of xs in this round, so the next round may restage it. Slice 0 reads parts below
         // before it reaches the next round's first barrier, and nobody writes parts before that
@@ -115,7 +122,7 @@ fn main(
             // In chunk order (D51). Only chunks that exist: adding an empty chunk's +0 would not
             // change the bits (total is never -0), but matmul doesn't add it either.
             for (var c = 0u; c < SLICES && r0 + c * CHUNK < params.n_in; c++) {
-                total += parts[c][j];
+                total += parts[c * outs + j];
             }
         }
     }

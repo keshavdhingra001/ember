@@ -40,6 +40,7 @@ pub(crate) struct Kernels {
     pub matmul: Kernel,
     pub matvec: Kernel,
     pub matvec_wide: Kernel,
+    pub matvec_split: Kernel,
     pub attention: Kernel,
     pub kv_write: Kernel,
     pub copy: Kernel,
@@ -83,6 +84,18 @@ impl Gpu {
         let k = |name, src| compute_pipeline(&device, name, src, &[]);
         // The row kernels share reduce.wgsl's trees: same source text, prepended.
         let with_reduce = |src: &str| [include_str!("shaders/reduce.wgsl"), src].concat();
+        // matvec.wgsl with its two override constants.
+        let matvec = |name, slices: u32, lookahead: bool| {
+            compute_pipeline(
+                &device,
+                name,
+                include_str!("shaders/matvec.wgsl"),
+                &[
+                    ("SLICES", slices as f64),
+                    ("LOOKAHEAD", lookahead as u32 as f64),
+                ],
+            )
+        };
         let kernels = Kernels {
             add: k("add", include_str!("shaders/add.wgsl")),
             gelu: k("gelu", include_str!("shaders/gelu.wgsl")),
@@ -97,13 +110,10 @@ impl Gpu {
             ),
             linear_naive: k("linear_naive", include_str!("shaders/linear_naive.wgsl")),
             matmul: k("matmul", include_str!("shaders/matmul.wgsl")),
-            matvec: k("matvec", include_str!("shaders/matvec.wgsl")),
-            matvec_wide: compute_pipeline(
-                &device,
-                "matvec_wide",
-                include_str!("shaders/matvec.wgsl"),
-                &[("LOOKAHEAD", 0.0)],
-            ),
+            // One source, three configurations (D48, D56): (slices, lookahead).
+            matvec: matvec("matvec", 1, true),
+            matvec_wide: matvec("matvec_wide", 1, false),
+            matvec_split: matvec("matvec_split", 4, true),
             attention: k(
                 "attention",
                 &with_reduce(include_str!("shaders/attention.wgsl")),
