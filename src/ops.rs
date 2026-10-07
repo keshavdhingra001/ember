@@ -186,6 +186,9 @@ const MATMUL_TILE: usize = 64;
 /// Threads per `matvec` workgroup. Must match `WG` in matvec.wgsl.
 const MATVEC_WG: usize = 256;
 
+/// Most rows `matvec_rows` takes (D57). Must match `ROWS` in matvec_rows.wgsl.
+const MATVEC_ROWS: usize = 8;
+
 /// Up to this many outputs, the matvec splits K four ways (D56): 768 outputs are 768 threads
 /// without the split, too few to keep the memory busy. Wider matrices have enough threads, and
 /// the split's shorter runs per row cost more than it saves. Measured at 768 (split wins) and
@@ -198,19 +201,22 @@ const MATVEC_SPLIT: usize = 1024;
 const MATVEC_WIDE: usize = 16384;
 
 /// `y = x @ w + b`: `x: [T, in]`, `w: [in, out]` (the GPU layout, D45), `b: [out]` or none.
-/// One row (a decode step) goes to the matrix-vector kernel, more rows to the tiled matmul
-/// (D43, D44). Both compute each output as the same chunked sum of fused multiply-adds (D51),
+/// One row (a decode step) goes to the matrix-vector kernel, up to 8 rows (a short prefill) to
+/// its multi-row form, more rows to the tiled matmul (D43, D44, D57). All compute each output as
+/// the same chunked sum of fused multiply-adds (D51),
 /// so a row's bits don't depend on which kernel ran it or what else was in the batch (D46).
 pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) -> Result<GpuTensor> {
     let (t, n_in, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
     let dims = (t, n_in, n_out);
-    if t == 1 {
-        let (kernel, slices) = if n_out <= MATVEC_SPLIT {
-            (&gpu.kernels.matvec_split, 4)
-        } else if n_out < MATVEC_WIDE {
-            (&gpu.kernels.matvec, 1)
-        } else {
-            (&gpu.kernels.matvec_wide, 1)
+    if t <= MATVEC_ROWS {
+        let k = &gpu.kernels;
+        let (kernel, slices) = match (t == 1, n_out) {
+            (true, ..=MATVEC_SPLIT) => (&k.matvec_split, 4),
+            (true, ..MATVEC_WIDE) => (&k.matvec, 1),
+            (true, _) => (&k.matvec_wide, 1),
+            (false, ..=MATVEC_SPLIT) => (&k.matvec_rows_split, 4),
+            (false, ..MATVEC_WIDE) => (&k.matvec_rows, 1),
+            (false, _) => (&k.matvec_rows_wide, 1),
         };
         // Must match the shader's outs = WG / SLICES.
         let groups = (n_out.div_ceil(MATVEC_WG / slices), 1);

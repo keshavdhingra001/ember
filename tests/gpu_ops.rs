@@ -291,9 +291,10 @@ fn matmul_and_matvec_give_a_row_the_same_bits() {
     // 777 = 3 chunks of 256 and 9 left over (one past the 8-load lookahead); 1300 = 5 chunks and
     // a partial one, so two split-matvec rounds, the second with 2 of its 4 slices empty; 3072 =
     // 3 full rounds. Up to 1024 outputs the matvec splits K, 2304 don't, 16384 run without
-    // lookahead (D48, D56).
+    // lookahead (D48, D56). 70 rows run the tiled matmul, 2-8 matvec_rows (D57).
     for (seed, (t, n_in, n_out)) in [
         (70, 777, 130),
+        (70, 1300, 2304),
         (3, 1300, 70),
         (5, 3072, 768),
         (3, 768, 2304),
@@ -308,16 +309,21 @@ fn matmul_and_matvec_give_a_row_the_same_bits() {
         let batch = g
             .read(&ops::linear(g, &gx, &gw, Some(&gb)).unwrap())
             .unwrap();
+        // Row i alone (matvec) and rows i.. in sub-batches of 2 and 8 (matvec_rows, D57), or
+        // fewer at the end, all against the whole batch.
         for i in [0, t / 2, t - 1] {
-            let row = g.upload(&rows(&x, i, i + 1));
-            let alone = g
-                .read(&ops::linear(g, &row, &gw, Some(&gb)).unwrap())
-                .unwrap();
-            assert_eq!(
-                bits(&alone),
-                bits(&rows(&batch, i, i + 1)),
-                "({t}, {n_in}, {n_out}) row {i}"
-            );
+            for len in [1, 2, 8] {
+                let end = (i + len).min(t);
+                let part = g.upload(&rows(&x, i, end));
+                let got = g
+                    .read(&ops::linear(g, &part, &gw, Some(&gb)).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    bits(&got),
+                    bits(&rows(&batch, i, end)),
+                    "({t}, {n_in}, {n_out}) rows {i}..{end}"
+                );
+            }
         }
     }
 }
@@ -354,14 +360,17 @@ fn chunked_linear(x: &Tensor, w: &Tensor, b: &Tensor) -> Tensor {
 #[test]
 fn linear_is_bitwise_the_chunked_sum() {
     let g = gpu();
-    // Row 1 runs the matvec: 70 and 130 outputs split K four ways, 2000 outputs don't, 16384
-    // run without lookahead (D56). More rows run the tiled matmul.
+    // Row 1 runs the matvec, 2-8 rows matvec_rows (D57): 70 and 130 outputs split K four ways,
+    // 2000 outputs don't, 16384 run without lookahead (D56). More rows run the tiled matmul.
     for (seed, (t, n_in, n_out)) in [
         (1, 1300, 70),
         (1, 3072, 130),
         (1, 1300, 2000),
         (1, 777, 16384),
         (3, 1300, 70),
+        (8, 1300, 2000),
+        (7, 777, 16384),
+        (2, 3072, 768),
         (70, 255, 65),
     ]
     .into_iter()

@@ -47,18 +47,19 @@ fn one_label_and_time_per_dispatch_in_order() {
     gpt2_gpu::extend(g, &gw, &mut cache, &[1, 2, 3]).unwrap();
     let times = g.profile_finish().unwrap();
 
-    // Three rows: the block's matrices run on the tiled matmul (D43).
+    // Three rows: the block's matrices (12 to 48 outputs) run on the multi-row matvec that splits
+    // K (D57, D56).
     let block = [
         "layer_norm",
-        "matmul",
+        "matvec_rows_split",
         "kv_write",
         "attention",
-        "matmul",
+        "matvec_rows_split",
         "add",
         "layer_norm",
-        "matmul",
+        "matvec_rows_split",
         "gelu",
-        "matmul",
+        "matvec_rows_split",
         "add",
     ];
     let mut want = vec!["embed"];
@@ -70,11 +71,11 @@ fn one_label_and_time_per_dispatch_in_order() {
     for t in &times {
         assert!(t.ns.is_finite() && t.ns > 0.0 && t.ns < 1e9, "{t:?}");
     }
-    let matmul = by_kernel(&times)
+    let rows = by_kernel(&times)
         .into_iter()
-        .find(|k| k.0 == "matmul")
+        .find(|k| k.0 == "matvec_rows_split")
         .unwrap();
-    assert_eq!(matmul.1, 8);
+    assert_eq!(rows.1, 8);
 }
 
 #[test]

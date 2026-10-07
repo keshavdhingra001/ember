@@ -30,6 +30,9 @@ pub(crate) struct Kernel {
 
 /// Every compute pipeline, compiled once at startup. Compiling WGSL to the driver's ISA takes
 /// milliseconds; doing it per call would dwarf the kernels themselves.
+const MATVEC: &str = include_str!("shaders/matvec.wgsl");
+const MATVEC_ROWS: &str = include_str!("shaders/matvec_rows.wgsl");
+
 pub(crate) struct Kernels {
     pub add: Kernel,
     pub gelu: Kernel,
@@ -41,6 +44,9 @@ pub(crate) struct Kernels {
     pub matvec: Kernel,
     pub matvec_wide: Kernel,
     pub matvec_split: Kernel,
+    pub matvec_rows: Kernel,
+    pub matvec_rows_wide: Kernel,
+    pub matvec_rows_split: Kernel,
     pub attention: Kernel,
     pub kv_write: Kernel,
     pub copy: Kernel,
@@ -84,12 +90,12 @@ impl Gpu {
         let k = |name, src| compute_pipeline(&device, name, src, &[]);
         // The row kernels share reduce.wgsl's trees: same source text, prepended.
         let with_reduce = |src: &str| [include_str!("shaders/reduce.wgsl"), src].concat();
-        // matvec.wgsl with its two override constants.
-        let matvec = |name, slices: u32, lookahead: bool| {
+        // matvec.wgsl or matvec_rows.wgsl with their two override constants.
+        let matvec = |name, src, slices: u32, lookahead: bool| {
             compute_pipeline(
                 &device,
                 name,
-                include_str!("shaders/matvec.wgsl"),
+                src,
                 &[
                     ("SLICES", slices as f64),
                     ("LOOKAHEAD", lookahead as u32 as f64),
@@ -111,9 +117,13 @@ impl Gpu {
             linear_naive: k("linear_naive", include_str!("shaders/linear_naive.wgsl")),
             matmul: k("matmul", include_str!("shaders/matmul.wgsl")),
             // One source, three configurations (D48, D56): (slices, lookahead).
-            matvec: matvec("matvec", 1, true),
-            matvec_wide: matvec("matvec_wide", 1, false),
-            matvec_split: matvec("matvec_split", 4, true),
+            matvec: matvec("matvec", MATVEC, 1, true),
+            matvec_wide: matvec("matvec_wide", MATVEC, 1, false),
+            matvec_split: matvec("matvec_split", MATVEC, 4, true),
+            // The same three for 2-8 rows (D57).
+            matvec_rows: matvec("matvec_rows", MATVEC_ROWS, 1, true),
+            matvec_rows_wide: matvec("matvec_rows_wide", MATVEC_ROWS, 1, false),
+            matvec_rows_split: matvec("matvec_rows_split", MATVEC_ROWS, 4, true),
             attention: k(
                 "attention",
                 &with_reduce(include_str!("shaders/attention.wgsl")),
