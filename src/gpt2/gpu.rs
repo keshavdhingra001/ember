@@ -12,7 +12,7 @@ use crate::gpt2::forward::greedy;
 use crate::gpt2::{Config, Linear, Norm, Weights};
 use crate::gpu::{Binds, Gpu, Rec};
 use crate::ops::{self, Epilogue};
-use crate::tensor::{GpuTensor, Tensor};
+use crate::tensor::{GpuTensor, Tensor, numel};
 
 pub struct GpuLinear {
     /// `[in, out]`: the transpose of the CPU's `[out, in]` (D45).
@@ -129,6 +129,7 @@ enum Role {
     Norm,
     Qkv,
     Att,
+    Parts,
     Fc,
     Last,
     Logits,
@@ -177,17 +178,21 @@ fn run(
     ops::embed_into(rec, &w.wte_t, &w.wpe, ids, ids_buf, start, &x)?;
     let n_head = w.config.n_head;
     for (l, b) in w.blocks.iter().enumerate() {
-        x = block(rec, bufs, w, b, &x, |rec, qkv, out| match attend {
-            Attend::Recompute => {
-                // A temporary cache of just these rows: the M2 op, a special case of D31.
-                let (k, v) = (gpu.alloc(&[t, e]), gpu.alloc(&[t, e]));
-                ops::kv_write_into(rec, qkv, &k, &v, 0)?;
-                ops::attention_into(rec, qkv, &k, &v, 0, n_head, out)
-            }
-            Attend::Cached { layers, start } => {
-                let (k, v) = &layers[l];
-                ops::kv_write_into(rec, qkv, k, v, *start)?;
-                ops::attention_into(rec, qkv, k, v, *start, n_head, out)
+        x = block(rec, bufs, w, b, &x, |rec, qkv, out| {
+            let parts_shape = ops::attention_parts_shape(t, start, e, n_head);
+            let parts = bufs.out(gpu, Role::Parts, &parts_shape)?;
+            match attend {
+                Attend::Recompute => {
+                    // A temporary cache of just these rows: the M2 op, a special case of D31.
+                    let (k, v) = (gpu.alloc(&[t, e]), gpu.alloc(&[t, e]));
+                    ops::kv_write_into(rec, qkv, &k, &v, 0)?;
+                    ops::attention_into(rec, qkv, &k, &v, 0, n_head, &parts, out)
+                }
+                Attend::Cached { layers, start } => {
+                    let (k, v) = &layers[l];
+                    ops::kv_write_into(rec, qkv, k, v, *start)?;
+                    ops::attention_into(rec, qkv, k, v, *start, n_head, &parts, out)
+                }
             }
         })?;
     }
@@ -303,10 +308,13 @@ struct WsBuffers {
 impl Workspace {
     fn new(gpu: &Gpu, config: &Config) -> Self {
         let (rows, e, v) = (config.n_ctx, config.n_embd, config.vocab_size);
+        let h = config.n_head;
         // GPT-2's MLP is 4E wide; another width fails `Bufs::out`'s size check.
         let floats = |role| match role {
             Role::ResA | Role::ResB | Role::Norm | Role::Att => rows * e,
             Role::Qkv => rows * 3 * e,
+            // Attention's chunk partials for a full prefill (D63): 52 MB for GPT-2 124M.
+            Role::Parts => numel(&ops::attention_parts_shape(rows, 0, e, h)),
             Role::Fc => rows * 4 * e,
             Role::Last => e,
             Role::Logits => v,
@@ -317,6 +325,7 @@ impl Workspace {
             Role::Norm,
             Role::Qkv,
             Role::Att,
+            Role::Parts,
             Role::Fc,
             Role::Last,
             Role::Logits,
@@ -335,7 +344,7 @@ impl Workspace {
 
 impl KvCache {
     /// Allocate K and V of `[n_ctx, E]` for every layer (75.5 MB for GPT-2 124M) and the
-    /// workspace (D59; 35 MB for GPT-2 124M).
+    /// workspace (D59, D63; 87 MB for GPT-2 124M, 52 MB of it attention's chunk partials).
     pub fn new(gpu: &Gpu, config: &Config) -> Self {
         let shape = [config.n_ctx, config.n_embd];
         KvCache {

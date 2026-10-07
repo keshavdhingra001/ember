@@ -53,6 +53,7 @@ pub(crate) struct Kernels {
     pub matvec_rows_wide: [Kernel; 3],
     pub matvec_rows_split: [Kernel; 3],
     pub attention: Kernel,
+    pub attention_combine: Kernel,
     pub kv_write: Kernel,
     pub copy: Kernel,
     pub fma_peak: Kernel,
@@ -188,6 +189,10 @@ impl Gpu {
             attention: k(
                 "attention",
                 &with_reduce(include_str!("shaders/attention.wgsl")),
+            ),
+            attention_combine: k(
+                "attention_combine",
+                include_str!("shaders/attention_combine.wgsl"),
             ),
             kv_write: k("kv_write", include_str!("shaders/kv_write.wgsl")),
             copy: k("copy", include_str!("shaders/copy.wgsl")),

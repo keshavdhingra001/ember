@@ -425,7 +425,8 @@ const ATTENTION_TOL: Tol = Tol {
 #[test]
 fn attention_matches_cpu() {
     let g = gpu();
-    // (T, n_head, E): T around the 64-thread workgroup, odd head widths, GPT-2's 12 x 64.
+    // (T, n_head, E): T around the 64-thread workgroup and the 64-key chunk, odd head widths,
+    // GPT-2's 12 x 64, and the widest head the kernel takes (64).
     let cases = [
         (1, 1, 4),
         (2, 2, 4),
@@ -433,7 +434,7 @@ fn attention_matches_cpu() {
         (64, 3, 12),
         (65, 3, 12),
         (200, 12, 768),
-        (130, 1, 130),
+        (130, 2, 128),
     ];
     for (seed, (t, h, e)) in cases.into_iter().enumerate() {
         let qkv = random(&[t, 3 * e], -2.0, 2.0, seed as u64);
@@ -470,19 +471,66 @@ fn attention_uses_the_true_score_max() {
 }
 
 #[test]
-fn attention_at_the_context_limit() {
+fn attention_uses_the_true_max_across_chunks() {
+    // Key 130 (chunk 2) scores ~113 for head 0 while chunks 0 and 1 score at most ~11. Rows
+    // from 130 on must rescale chunks 0 and 1 to chunk 2's max (D63); a combine that kept the
+    // first chunk's max overflows exp and gives inf or NaN, one that ignored a chunk's max
+    // gives wrong weights.
     let g = gpu();
-    let max = ops::ATTENTION_MAX_CTX;
-    let qkv = random(&[max, 3 * 16], -2.0, 2.0, 77);
+    let (t, h, e) = (200, 2, 16);
+    let mut qkv = random(&[t, 3 * e], -1.0, 1.0, 42).data().to_vec();
+    for i in 0..t {
+        qkv[i * 3 * e..][..8].fill(4.0); // head 0 of Q
+    }
+    qkv[130 * 3 * e + e..][..8].fill(10.0); // head 0 of K at position 130
+    let qkv = Tensor::new(&[t, 3 * e], qkv).unwrap();
     let gq = g.upload(&qkv);
     compare(
-        &format!("attention T={max} H=2 E=16"),
-        &cpu::causal_attention(&qkv, 2).unwrap(),
+        "attention dominant key in chunk 2",
+        &cpu::causal_attention(&qkv, h).unwrap(),
         ATTENTION_TOL,
-        || g.read(&ops::causal_attention(g, &gq, 2).unwrap()).unwrap(),
+        || g.read(&ops::causal_attention(g, &gq, h).unwrap()).unwrap(),
     );
-    let too_long = g.upload(&Tensor::zeros(&[max + 1, 48]));
-    assert!(ops::causal_attention(g, &too_long, 2).is_err());
+}
+
+#[test]
+fn attention_at_chunk_boundaries_and_past_1024() {
+    // D64: T at the chunk edges (63, 64, 65 keys for the last row; 16 vs 17 chunks at
+    // 1024/1025) and past the old 1024-position limit of D20. Every row i of a prefill sees
+    // i + 1 keys, so the long cases also cover every key count below them.
+    let g = gpu();
+    for (seed, t) in [63, 64, 65, 1023, 1024, 1025, 1300].into_iter().enumerate() {
+        let qkv = random(&[t, 3 * 16], -2.0, 2.0, 77 + seed as u64);
+        let gq = g.upload(&qkv);
+        compare(
+            &format!("attention T={t} H=2 E=16"),
+            &cpu::causal_attention(&qkv, 2).unwrap(),
+            ATTENTION_TOL,
+            || g.read(&ops::causal_attention(g, &gq, 2).unwrap()).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn attention_rejects_wide_heads_and_small_scratch() {
+    let g = gpu();
+    // One head of 65 dims: past ATTENTION_MAX_D.
+    let d = ops::ATTENTION_MAX_D + 1;
+    let wide = g.upload(&Tensor::zeros(&[2, 3 * d]));
+    assert!(ops::causal_attention(g, &wide, 1).is_err());
+
+    // A parts scratch one float short.
+    let (t, h, e) = (65, 2, 16);
+    let qkv = g.upload(&random(&[t, 3 * e], -1.0, 1.0, 5));
+    let (k, v) = (g.alloc(&[t, e]), g.alloc(&[t, e]));
+    ops::kv_write(g, &qkv, &k, &v, 0).unwrap();
+    let shape = ops::attention_parts_shape(t, 0, e, h);
+    assert_eq!(shape, [65, 2, 2, 10]);
+    let n: usize = shape.iter().product();
+    let short = g.alloc(&[n - 1]);
+    let out = g.alloc(&[t, e]);
+    let mut rec = g.rec();
+    assert!(ops::attention_into(&mut rec, &qkv, &k, &v, 0, h, &short, &out).is_err());
 }
 
 // ------------------------------------------------------------------ row
@@ -725,8 +773,9 @@ fn into_ops_write_only_their_view() {
     let want = g
         .read(&ops::attention_cached(g, &qkv, &k, &vc, 4, h).unwrap())
         .unwrap();
+    let parts = g.alloc(&ops::attention_parts_shape(t, 4, e, h));
     into_oversized("attention", &[t, e], &want, |r, o| {
-        ops::attention_into(r, &qkv, &k, &vc, 4, h, o)
+        ops::attention_into(r, &qkv, &k, &vc, 4, h, &parts, o)
     });
 
     // Every linear kernel: matvec split / plain / wide, matvec_rows likewise, matmul; with and

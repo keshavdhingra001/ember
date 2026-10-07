@@ -9,11 +9,14 @@
 use crate::error::{Error, Result};
 use crate::gpu::{Gpu, Kernel, Rec};
 use crate::shape;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, numel};
 
-/// Longest sequence the attention kernel takes: its scores live in a shared-memory array of
-/// this size. Must match `MAX_CTX` in attention.wgsl.
-pub const ATTENTION_MAX_CTX: usize = 1024;
+/// Keys per attention chunk (D63). Must match `KC` in attention.wgsl and attention_combine.wgsl.
+pub const ATTENTION_CHUNK: usize = 64;
+
+/// Largest head dimension the attention kernel takes: a chunk's keys are staged in shared
+/// memory in rows of this many floats. Must match `MAX_D` in attention.wgsl.
+pub const ATTENTION_MAX_D: usize = 64;
 
 /// Threads per workgroup for 1-D elementwise kernels. Must match `WG` in the shaders.
 pub const ELEMENTWISE_WG: u32 = 256;
@@ -473,7 +476,16 @@ struct AttentionParams {
     d: u32,
     scale: f32,
     start: u32,
-    _pad: [u32; 3],
+    n_chunks: u32,
+    _pad: [u32; 2],
+}
+
+/// Shape of attention's per-chunk partials for `T` queries from `start` (D63):
+/// `[T, heads, n_chunks, d + 2]`, each chunk's (max, sum of exponentials, unnormalized output).
+/// `n_chunks` covers the last query's keys; earlier rows leave their trailing chunks unwritten.
+pub fn attention_parts_shape(t: usize, start: usize, e: usize, n_head: usize) -> [usize; 4] {
+    let d = e.checked_div(n_head).unwrap_or(0);
+    [t, n_head, (start + t).div_ceil(ATTENTION_CHUNK), d + 2]
 }
 
 /// `[T, 3E]` -> `(T, E)`, checking that 3E splits into 3 x `n_head` heads.
@@ -555,12 +567,16 @@ pub fn attention_cached(
     n_head: usize,
 ) -> Result<GpuTensor> {
     let (t, e) = qkv_dims("attention", qkv, n_head)?;
+    let parts = gpu.alloc(&attention_parts_shape(t, start, e, n_head));
     once(gpu, &[t, e], |rec, out| {
-        attention_into(rec, qkv, k_cache, v_cache, start, n_head, out)
+        attention_into(rec, qkv, k_cache, v_cache, start, n_head, &parts, out)
     })
 }
 
-/// `attention_cached` into `out` (D61).
+/// `attention_cached` into `out` (D61), with `parts` as the scratch for the chunk partials
+/// (shape from `attention_parts_shape`; a larger buffer is fine). Two dispatches (D63): every
+/// (row, head, chunk of 64 keys) into `parts`, then every (row, head) merges its chunks.
+#[allow(clippy::too_many_arguments)]
 pub fn attention_into(
     rec: &mut Rec,
     qkv: &GpuTensor,
@@ -568,38 +584,51 @@ pub fn attention_into(
     v_cache: &GpuTensor,
     start: usize,
     n_head: usize,
+    parts: &GpuTensor,
     out: &GpuTensor,
 ) -> Result<()> {
     let (t, e) = qkv_dims("attention", qkv, n_head)?;
     check_cache("attention", k_cache, v_cache, e, start + t)?;
     check_out("attention", out, &[t, e])?;
-    if start + t > ATTENTION_MAX_CTX {
-        return Err(Error::Input(format!(
-            "attention: {} positions exceed the kernel's {ATTENTION_MAX_CTX}",
-            start + t
-        )));
-    }
-    if n_head > rec.gpu.max_groups() as usize {
+    let shape = attention_parts_shape(t, start, e, n_head);
+    check_out("attention parts", parts, &shape)?;
+    let d = shape[3] - 2;
+    if d > ATTENTION_MAX_D {
         return Err(Error::Shape(format!(
-            "attention: {n_head} heads exceed one dispatch dimension"
+            "attention: head dimension {d} exceeds the kernel's {ATTENTION_MAX_D}"
         )));
     }
+    let max = rec.gpu.max_groups() as usize;
+    if t > max || n_head > max || shape[2] > max {
+        return Err(Error::Shape(format!(
+            "attention: {t} rows, {n_head} heads or {} chunks exceed one dispatch dimension",
+            shape[2]
+        )));
+    }
+    len_u32(numel(&shape))?;
     if t == 0 || e == 0 {
         return Ok(());
     }
-    let d = e / n_head;
     let params = AttentionParams {
         t: t as u32,
         e: e as u32,
         d: d as u32,
         scale: 1.0 / (d as f32).sqrt(),
         start: start as u32,
-        _pad: [0; 3],
+        n_chunks: shape[2] as u32,
+        _pad: [0; 2],
     };
+    let params = bytemuck::bytes_of(&params);
     rec.dispatch(
         &rec.gpu.kernels.attention,
-        &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer, &out.buffer],
-        bytemuck::bytes_of(&params),
+        &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer, &parts.buffer],
+        params,
+        (t as u32, n_head as u32, shape[2] as u32),
+    )?;
+    rec.dispatch(
+        &rec.gpu.kernels.attention_combine,
+        &[&parts.buffer, &out.buffer],
+        params,
         (t as u32, n_head as u32, 1),
     )
 }

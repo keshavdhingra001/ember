@@ -907,6 +907,17 @@ position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
 - **Alternatives:** one pass where the last workgroup combines (an atomic counter); full
   FlashAttention-2 with tiles of queries for long prompts (prefill is short today; deferred).
 - **Why:** decode attention runs 12 workgroups today; at position 1000 this is 192.
+- **Built (2026-10-08):** `attention.wgsl` (pass 1, `reduce.wgsl` prepended) and
+  `attention_combine.wgsl` (pass 2). Pass 1 stages 32 keys at a time with rows padded to 65
+  floats (8.1 KiB of keys, 8.9 KiB of workgroup memory in all, under WebGPU's default 16 KiB;
+  all 64 keys would be 16.6 KiB). That padding caps the head dimension at 64
+  (`ATTENTION_MAX_D`, checked on the host; GPT-2, SmolLM2 and Qwen2.5 all use 64). Partials are
+  `[T, heads, n_chunks, d + 2]` with `n_chunks = ceil((start + T) / 64)`; the workspace's
+  `Role::Parts` is sized for a full prefill: 1024 × 12 × 16 × 66 floats = 52 MB for GPT-2
+  124M (workspace 35 → 87 MB). `ATTENTION_MAX_CTX` is gone; tested to 1300 positions. Tests:
+  T = 63, 64, 65, 1023, 1024, 1025, 1300 against the CPU at the unchanged tolerance, a dominant
+  key in chunk 2 (the combine must rescale to the global max), the d > 64 and short-scratch
+  rejections, and the existing bitwise decode-vs-recompute tests.
 
 ### D64: M7 tests
 - **What:** outputs into oversized buffers pre-filled with sentinels (D9): the elements past the

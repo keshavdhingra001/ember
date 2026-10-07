@@ -54,6 +54,7 @@ fn one_label_and_time_per_dispatch_in_order() {
         "matvec_rows_split",
         "kv_write",
         "attention",
+        "attention_combine",
         "matvec_rows_split+res",
         "layer_norm",
         "matvec_rows_split+gelu",
