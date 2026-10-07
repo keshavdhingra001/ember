@@ -651,3 +651,109 @@ fn embed_at_an_offset() {
     assert_eq!(got.data(), rows(&want, 5, 8).data());
     assert!(ops::embed(g, &gwte, &gwpe, &ids[..2], 15).is_err());
 }
+
+// ------------------------------------------------------------------ outputs into a workspace
+
+/// Run `record` (one `_into` op writing `out`) with `out` a view of a buffer `extra` floats
+/// larger, pre-filled with a sentinel (D9, D64). The extra floats must keep the sentinel, and
+/// the view must hold exactly what `want` (the one-op form) gives.
+fn into_oversized(
+    label: &str,
+    shape: &[usize],
+    want: &Tensor,
+    record: impl FnOnce(&mut ember::gpu::Rec, &ember::GpuTensor) -> ember::Result<()>,
+) {
+    const SENTINEL: f32 = -7777.25;
+    const EXTRA: usize = 37;
+    let g = gpu();
+    let n: usize = shape.iter().product();
+    let big = g.upload(&Tensor::new(&[n + EXTRA], vec![SENTINEL; n + EXTRA]).unwrap());
+    let out = big.view(shape).unwrap();
+    let mut rec = g.rec();
+    record(&mut rec, &out).unwrap();
+    rec.submit();
+    let all = g.read(&big).unwrap();
+    let view: Vec<u32> = all.data()[..n].iter().map(|x| x.to_bits()).collect();
+    assert_eq!(view, bits(want), "{label}: view");
+    assert!(
+        all.data()[n..].iter().all(|&x| x == SENTINEL),
+        "{label}: wrote past the view"
+    );
+}
+
+#[test]
+fn into_ops_write_only_their_view() {
+    let g = gpu();
+    let (t, e) = (3, 12);
+    let x = g.upload(&random(&[t, e], -2.0, 2.0, 70));
+    let y = g.upload(&random(&[t, e], -2.0, 2.0, 71));
+    let want = g.read(&ops::add(g, &x, &y).unwrap()).unwrap();
+    into_oversized("add", &[t, e], &want, |r, o| ops::add_into(r, &x, &y, o));
+    let want = g.read(&ops::gelu(g, &x).unwrap()).unwrap();
+    into_oversized("gelu", &[t, e], &want, |r, o| ops::gelu_into(r, &x, o));
+
+    let (gain, bias) = (
+        g.upload(&random(&[e], 0.5, 1.5, 72)),
+        g.upload(&random(&[e], -0.5, 0.5, 73)),
+    );
+    let want = g
+        .read(&ops::layer_norm(g, &x, &gain, &bias, 1e-5).unwrap())
+        .unwrap();
+    into_oversized("layer_norm", &[t, e], &want, |r, o| {
+        ops::layer_norm_into(r, &x, &gain, &bias, 1e-5, o)
+    });
+
+    let (v, n_ctx) = (17, 9);
+    let wte_t = g.upload(&random(&[e, v], -1.0, 1.0, 74));
+    let wpe = g.upload(&random(&[n_ctx, e], -1.0, 1.0, 75));
+    let ids = [3u32, 16, 0];
+    let want = g
+        .read(&ops::embed(g, &wte_t, &wpe, &ids, 2).unwrap())
+        .unwrap();
+    let ids_buf = g.upload_u32(&ids);
+    into_oversized("embed", &[t, e], &want, |r, o| {
+        ops::embed_into(r, &wte_t, &wpe, &ids, &ids_buf, 2, o)
+    });
+
+    let want = g.read(&ops::row(g, &x, 1).unwrap()).unwrap();
+    into_oversized("row", &[1, e], &want, |r, o| ops::row_into(r, &x, 1, o));
+
+    let h = 3;
+    let qkv = g.upload(&random(&[t, 3 * e], -1.0, 1.0, 76));
+    let (k, vc) = (g.alloc(&[n_ctx, e]), g.alloc(&[n_ctx, e]));
+    ops::kv_write(g, &qkv, &k, &vc, 4).unwrap();
+    let want = g
+        .read(&ops::attention_cached(g, &qkv, &k, &vc, 4, h).unwrap())
+        .unwrap();
+    into_oversized("attention", &[t, e], &want, |r, o| {
+        ops::attention_into(r, &qkv, &k, &vc, 4, h, o)
+    });
+
+    // Every linear kernel: matvec split / plain / wide, matvec_rows likewise, matmul; with and
+    // without a bias.
+    for (seed, (t, n_in, n_out)) in [
+        (1, 300, 70),
+        (1, 300, 2304),
+        (1, 20, 16384),
+        (5, 300, 70),
+        (5, 300, 2304),
+        (2, 20, 16384),
+        (70, 300, 130),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (xc, w, b) = linear_case(t, n_in, n_out, 80 + seed as u64);
+        let (gx, gb) = (g.upload(&xc), g.upload(&b));
+        let gw = g.upload(&cpu::transpose(&w).unwrap());
+        for bias in [Some(&gb), None] {
+            let want = g.read(&ops::linear(g, &gx, &gw, bias).unwrap()).unwrap();
+            into_oversized(
+                &format!("linear ({t}, {n_in}, {n_out}) bias {}", bias.is_some()),
+                &[t, n_out],
+                &want,
+                |r, o| ops::linear_into(r, &gx, &gw, bias, o),
+            );
+        }
+    }
+}

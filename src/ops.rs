@@ -1,8 +1,13 @@
-//! GPU ops: host-side wrappers that check shapes, allocate the output and dispatch a kernel.
-//! Each one has a CPU twin in `cpu.rs` that it is tested against.
+//! GPU ops: host-side wrappers that check shapes and record a kernel. Each one has a CPU twin
+//! in `cpu.rs` that it is tested against.
+//!
+//! The ops the model runs come in two forms (D61): `op_into(rec, …, out)` records into a
+//! caller's `Rec` and writes a caller's output tensor (the workspace path, D59), and `op(gpu, …)`
+//! allocates the output, records into a recording of its own and submits it. Both run the same
+//! recording code.
 
 use crate::error::{Error, Result};
-use crate::gpu::{Gpu, Kernel};
+use crate::gpu::{Gpu, Kernel, Rec};
 use crate::shape;
 use crate::tensor::GpuTensor;
 
@@ -27,20 +32,70 @@ pub fn add_with_max_groups(
     max_groups: u32,
 ) -> Result<GpuTensor> {
     shape::same("add", a.shape(), b.shape())?;
-    let out = gpu.alloc(a.shape());
+    once(gpu, a.shape(), |rec, out| {
+        add_groups(rec, a, b, out, max_groups)
+    })
+}
+
+/// `add` into `out` (D61).
+pub fn add_into(rec: &mut Rec, a: &GpuTensor, b: &GpuTensor, out: &GpuTensor) -> Result<()> {
+    add_groups(rec, a, b, out, rec.gpu.max_groups())
+}
+
+fn add_groups(
+    rec: &mut Rec,
+    a: &GpuTensor,
+    b: &GpuTensor,
+    out: &GpuTensor,
+    max_groups: u32,
+) -> Result<()> {
+    shape::same("add", a.shape(), b.shape())?;
+    check_out("add", out, a.shape())?;
     let n = a.len();
     if n == 0 {
-        return Ok(out);
+        return Ok(());
     }
     let params = Params4::new(len_u32(n)?, 0, 0, 0);
+    let kernel = &rec.gpu.kernels.add;
     elementwise(
-        gpu,
-        &gpu.kernels.add,
+        rec,
+        kernel,
         &[&a.buffer, &b.buffer, &out.buffer],
         params,
         max_groups,
-    );
+    )
+}
+
+/// The one-op form (D61): allocate `shape`, record `f` writing it, submit.
+fn once(
+    gpu: &Gpu,
+    shape: &[usize],
+    f: impl FnOnce(&mut Rec, &GpuTensor) -> Result<()>,
+) -> Result<GpuTensor> {
+    let out = gpu.alloc(shape);
+    let mut rec = gpu.rec();
+    f(&mut rec, &out)?;
+    rec.submit();
     Ok(out)
+}
+
+/// An `_into` op's output must have the op's shape, and its buffer may be larger (a workspace
+/// view, D59) but not smaller: kernels bound their writes by the shape, never the buffer (D9).
+fn check_out(op: &str, out: &GpuTensor, shape: &[usize]) -> Result<()> {
+    if out.shape() != shape {
+        return Err(Error::Shape(format!(
+            "{op}: output {:?}, expected {shape:?}",
+            out.shape()
+        )));
+    }
+    if (out.buffer.size() as usize) < out.len() * 4 {
+        return Err(Error::Shape(format!(
+            "{op}: output buffer of {} bytes holds less than {:?}",
+            out.buffer.size(),
+            out.shape()
+        )));
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -58,36 +113,38 @@ impl Params4 {
     }
 }
 
-/// Dispatch a grid-stride elementwise kernel (D8): `buffers` in binding order, then `params` as
+/// Record a grid-stride elementwise kernel (D8): `buffers` in binding order, then `params` as
 /// the last binding, whose first field is the element count.
 fn elementwise(
-    gpu: &Gpu,
+    rec: &mut Rec,
     kernel: &Kernel,
     buffers: &[&wgpu::Buffer],
     params: Params4,
     max_groups: u32,
-) {
-    let uniform = gpu.uniform(&params);
-    let mut bindings = buffers.to_vec();
-    bindings.push(&uniform);
+) -> Result<()> {
     let groups = elementwise_groups(params.a as usize, max_groups);
-    gpu.dispatch(kernel, &bindings, (groups, 1, 1));
+    rec.dispatch(kernel, buffers, bytemuck::bytes_of(&params), (groups, 1, 1))
 }
 
 /// Elementwise GPT-2 GELU (tanh approximation).
 pub fn gelu(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
-    let out = gpu.alloc(x.shape());
+    once(gpu, x.shape(), |rec, out| gelu_into(rec, x, out))
+}
+
+/// `gelu` into `out` (D61).
+pub fn gelu_into(rec: &mut Rec, x: &GpuTensor, out: &GpuTensor) -> Result<()> {
+    check_out("gelu", out, x.shape())?;
     if x.is_empty() {
-        return Ok(out);
+        return Ok(());
     }
+    let kernel = &rec.gpu.kernels.gelu;
     elementwise(
-        gpu,
-        &gpu.kernels.gelu,
+        rec,
+        kernel,
         &[&x.buffer, &out.buffer],
         Params4::new(len_u32(x.len())?, 0, 0, 0),
-        gpu.max_groups(),
-    );
-    Ok(out)
+        rec.gpu.max_groups(),
+    )
 }
 
 /// `out[t] = wte[ids[t]] + wpe[start + t]`: token embedding plus the embedding of its absolute
@@ -101,27 +158,61 @@ pub fn embed(
     ids: &[u32],
     start: usize,
 ) -> Result<GpuTensor> {
+    let (e, _) = embed_dims(wte_t, wpe, ids, start)?;
+    let ids_buf = gpu.upload_u32(ids);
+    once(gpu, &[ids.len(), e], |rec, out| {
+        embed_into(rec, wte_t, wpe, ids, &ids_buf, start, out)
+    })
+}
+
+/// `embed` into `out` (D61), with the ids taken from `ids_buf`, which must already hold `ids`
+/// (or have them written in this recording). `ids` itself is only checked.
+pub fn embed_into(
+    rec: &mut Rec,
+    wte_t: &GpuTensor,
+    wpe: &GpuTensor,
+    ids: &[u32],
+    ids_buf: &wgpu::Buffer,
+    start: usize,
+    out: &GpuTensor,
+) -> Result<()> {
+    let (e, v) = embed_dims(wte_t, wpe, ids, start)?;
+    check_out("embed", out, &[ids.len(), e])?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if (ids_buf.size() as usize) < ids.len() * 4 {
+        return Err(Error::Shape(format!(
+            "embed: id buffer of {} bytes for {} ids",
+            ids_buf.size(),
+            ids.len()
+        )));
+    }
+    let n = len_u32(ids.len() * e)?;
+    let kernel = &rec.gpu.kernels.embed;
+    elementwise(
+        rec,
+        kernel,
+        &[&wte_t.buffer, &wpe.buffer, ids_buf, &out.buffer],
+        Params4::new(n, e as u32, start as u32, len_u32(v)?),
+        rec.gpu.max_groups(),
+    )
+}
+
+/// `(E, V)` after checking the tables, the ids and the positions.
+fn embed_dims(
+    wte_t: &GpuTensor,
+    wpe: &GpuTensor,
+    ids: &[u32],
+    start: usize,
+) -> Result<(usize, usize)> {
     let &[e_rows, v] = wte_t.shape() else {
         return Err(Error::Shape(format!(
             "embed: wte_t {:?} must be 2-D",
             wte_t.shape()
         )));
     };
-    let e = shape::embed(&[v, e_rows], wpe.shape(), ids, start)?;
-    let out = gpu.alloc(&[ids.len(), e]);
-    if ids.is_empty() {
-        return Ok(out);
-    }
-    let n = len_u32(ids.len() * e)?;
-    let ids_buf = gpu.upload_u32(ids);
-    elementwise(
-        gpu,
-        &gpu.kernels.embed,
-        &[&wte_t.buffer, &wpe.buffer, &ids_buf, &out.buffer],
-        Params4::new(n, e as u32, start as u32, len_u32(v)?),
-        gpu.max_groups(),
-    );
-    Ok(out)
+    Ok((shape::embed(&[v, e_rows], wpe.shape(), ids, start)?, v))
 }
 
 /// `[rows, cols]` for the row kernels, which launch one workgroup per row.
@@ -141,17 +232,17 @@ fn rows_cols(gpu: &Gpu, op: &str, x: &GpuTensor) -> Result<(u32, u32)> {
 /// Softmax over the last dimension of `x: [rows, cols]`.
 pub fn softmax_rows(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
     let (rows, cols) = rows_cols(gpu, "softmax_rows", x)?;
-    let out = gpu.alloc(x.shape());
-    if rows == 0 || cols == 0 {
-        return Ok(out);
-    }
-    let params = gpu.uniform(&Params4::new(cols, 0, 0, 0));
-    gpu.dispatch(
-        &gpu.kernels.softmax,
-        &[&x.buffer, &out.buffer, &params],
-        (rows, 1, 1),
-    );
-    Ok(out)
+    once(gpu, x.shape(), |rec, out| {
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        rec.dispatch(
+            &gpu.kernels.softmax,
+            &[&x.buffer, &out.buffer],
+            bytemuck::bytes_of(&Params4::new(cols, 0, 0, 0)),
+            (rows, 1, 1),
+        )
+    })
 }
 
 /// LayerNorm over the last dimension of `x: [rows, cols]` with `gain`, `bias`: `[cols]`.
@@ -162,19 +253,32 @@ pub fn layer_norm(
     bias: &GpuTensor,
     eps: f32,
 ) -> Result<GpuTensor> {
+    once(gpu, x.shape(), |rec, out| {
+        layer_norm_into(rec, x, gain, bias, eps, out)
+    })
+}
+
+/// `layer_norm` into `out` (D61).
+pub fn layer_norm_into(
+    rec: &mut Rec,
+    x: &GpuTensor,
+    gain: &GpuTensor,
+    bias: &GpuTensor,
+    eps: f32,
+    out: &GpuTensor,
+) -> Result<()> {
     shape::layer_norm(x.shape(), gain.shape(), bias.shape())?;
-    let (rows, cols) = rows_cols(gpu, "layer_norm", x)?;
-    let out = gpu.alloc(x.shape());
+    let (rows, cols) = rows_cols(rec.gpu, "layer_norm", x)?;
+    check_out("layer_norm", out, x.shape())?;
     if rows == 0 || cols == 0 {
-        return Ok(out);
+        return Ok(());
     }
-    let params = gpu.uniform(&Params4::new(cols, eps.to_bits(), 0, 0));
-    gpu.dispatch(
-        &gpu.kernels.layer_norm,
-        &[&x.buffer, &gain.buffer, &bias.buffer, &out.buffer, &params],
+    rec.dispatch(
+        &rec.gpu.kernels.layer_norm,
+        &[&x.buffer, &gain.buffer, &bias.buffer, &out.buffer],
+        bytemuck::bytes_of(&Params4::new(cols, eps.to_bits(), 0, 0)),
         (rows, 1, 1),
-    );
-    Ok(out)
+    )
 }
 
 /// Threads per side of `linear_naive`'s 2-D workgroup. Must match `@workgroup_size(16, 16)`.
@@ -206,8 +310,21 @@ const MATVEC_WIDE: usize = 16384;
 /// the same chunked sum of fused multiply-adds (D51),
 /// so a row's bits don't depend on which kernel ran it or what else was in the batch (D46).
 pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) -> Result<GpuTensor> {
+    let (t, _, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
+    once(gpu, &[t, n_out], |rec, out| linear_into(rec, x, w, b, out))
+}
+
+/// `linear` into `out` (D61).
+pub fn linear_into(
+    rec: &mut Rec,
+    x: &GpuTensor,
+    w: &GpuTensor,
+    b: Option<&GpuTensor>,
+    out: &GpuTensor,
+) -> Result<()> {
     let (t, n_in, n_out) = shape::linear_in_out(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
     let dims = (t, n_in, n_out);
+    let gpu = rec.gpu;
     if t <= MATVEC_ROWS {
         let k = &gpu.kernels;
         let (kernel, slices) = match (t == 1, n_out) {
@@ -220,10 +337,10 @@ pub fn linear(gpu: &Gpu, x: &GpuTensor, w: &GpuTensor, b: Option<&GpuTensor>) ->
         };
         // Must match the shader's outs = WG / SLICES.
         let groups = (n_out.div_ceil(MATVEC_WG / slices), 1);
-        linear_dispatch(gpu, kernel, x, w, b, dims, groups)
+        linear_dispatch(rec, kernel, x, w, b, dims, groups, out)
     } else {
         let groups = (n_out.div_ceil(MATMUL_TILE), t.div_ceil(MATMUL_TILE));
-        linear_dispatch(gpu, &gpu.kernels.matmul, x, w, b, dims, groups)
+        linear_dispatch(rec, &gpu.kernels.matmul, x, w, b, dims, groups, out)
     }
 }
 
@@ -239,54 +356,47 @@ pub fn linear_naive(
     let dims = shape::linear(x.shape(), w.shape(), b.map(GpuTensor::shape))?;
     let (t, _, n_out) = dims;
     let groups = (n_out.div_ceil(NAIVE_TILE), t.div_ceil(NAIVE_TILE));
-    linear_dispatch(gpu, &gpu.kernels.linear_naive, x, w, b, dims, groups)
+    once(gpu, &[t, n_out], |rec, out| {
+        linear_dispatch(rec, &gpu.kernels.linear_naive, x, w, b, dims, groups, out)
+    })
 }
 
 /// Shared by the three linear kernels: they take the same bindings and `(t, in, out, has_bias)`
 /// parameters, `dims = (t, in, out)` already checked against the kernel's weight layout.
+#[allow(clippy::too_many_arguments)]
 fn linear_dispatch(
-    gpu: &Gpu,
+    rec: &mut Rec,
     kernel: &Kernel,
     x: &GpuTensor,
     w: &GpuTensor,
     b: Option<&GpuTensor>,
     (t, n_in, n_out): (usize, usize, usize),
     (gx, gy): (usize, usize),
-) -> Result<GpuTensor> {
-    let out = gpu.alloc(&[t, n_out]);
+    out: &GpuTensor,
+) -> Result<()> {
+    check_out("linear", out, &[t, n_out])?;
     if t == 0 || n_out == 0 {
-        return Ok(out);
+        return Ok(());
     }
     len_u32(t * n_in.max(n_out))?;
     len_u32(n_out * n_in)?;
-    let max = gpu.max_groups() as usize;
+    let max = rec.gpu.max_groups() as usize;
     if gx > max || gy > max {
         return Err(Error::Shape(format!(
             "linear: [{t}, {n_out}] output needs more than {max} workgroups per dimension"
         )));
     }
-    let params = gpu.uniform(&Params4::new(
-        t as u32,
-        n_in as u32,
-        n_out as u32,
-        b.is_some() as u32,
-    ));
-    // Without a bias the binding still needs some buffer, and it can't be `out`: one buffer
-    // bound read-only and read-write in the same dispatch is a validation error.
-    let dummy;
-    let bias = match b {
-        Some(b) => &b.buffer,
-        None => {
-            dummy = gpu.alloc(&[1]);
-            &dummy.buffer
-        }
-    };
-    gpu.dispatch(
+    let params = Params4::new(t as u32, n_in as u32, n_out as u32, b.is_some() as u32);
+    // Without a bias the binding still needs some buffer. `w` serves: it is never read through
+    // that binding, and binding one buffer twice read-only is allowed (`out`, read-write,
+    // would be a validation error). A buffer allocated for it would be a creation per call (D60).
+    let bias = b.map_or(&w.buffer, |b| &b.buffer);
+    rec.dispatch(
         kernel,
-        &[&x.buffer, &w.buffer, bias, &out.buffer, &params],
+        &[&x.buffer, &w.buffer, bias, &out.buffer],
+        bytemuck::bytes_of(&params),
         (gx as u32, gy as u32, 1),
-    );
-    Ok(out)
+    )
 }
 
 #[repr(C)]
@@ -339,19 +449,33 @@ pub fn kv_write(
     v_cache: &GpuTensor,
     start: usize,
 ) -> Result<()> {
+    let mut rec = gpu.rec();
+    kv_write_into(&mut rec, qkv, k_cache, v_cache, start)?;
+    rec.submit();
+    Ok(())
+}
+
+/// `kv_write` recorded into `rec` (D61).
+pub fn kv_write_into(
+    rec: &mut Rec,
+    qkv: &GpuTensor,
+    k_cache: &GpuTensor,
+    v_cache: &GpuTensor,
+    start: usize,
+) -> Result<()> {
     let (t, e) = qkv_dims("kv_write", qkv, 1)?;
     check_cache("kv_write", k_cache, v_cache, e, start + t)?;
     if t == 0 || e == 0 {
         return Ok(());
     }
+    let kernel = &rec.gpu.kernels.kv_write;
     elementwise(
-        gpu,
-        &gpu.kernels.kv_write,
+        rec,
+        kernel,
         &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer],
         Params4::new((t * e) as u32, e as u32, start as u32, 0),
-        gpu.max_groups(),
-    );
-    Ok(())
+        rec.gpu.max_groups(),
+    )
 }
 
 /// Attention for the queries in `qkv: [T, 3E]` at absolute positions `start..start + T`, over
@@ -365,43 +489,53 @@ pub fn attention_cached(
     n_head: usize,
 ) -> Result<GpuTensor> {
     let (t, e) = qkv_dims("attention", qkv, n_head)?;
+    once(gpu, &[t, e], |rec, out| {
+        attention_into(rec, qkv, k_cache, v_cache, start, n_head, out)
+    })
+}
+
+/// `attention_cached` into `out` (D61).
+pub fn attention_into(
+    rec: &mut Rec,
+    qkv: &GpuTensor,
+    k_cache: &GpuTensor,
+    v_cache: &GpuTensor,
+    start: usize,
+    n_head: usize,
+    out: &GpuTensor,
+) -> Result<()> {
+    let (t, e) = qkv_dims("attention", qkv, n_head)?;
     check_cache("attention", k_cache, v_cache, e, start + t)?;
+    check_out("attention", out, &[t, e])?;
     if start + t > ATTENTION_MAX_CTX {
         return Err(Error::Input(format!(
             "attention: {} positions exceed the kernel's {ATTENTION_MAX_CTX}",
             start + t
         )));
     }
-    if n_head > gpu.max_groups() as usize {
+    if n_head > rec.gpu.max_groups() as usize {
         return Err(Error::Shape(format!(
             "attention: {n_head} heads exceed one dispatch dimension"
         )));
     }
-    let out = gpu.alloc(&[t, e]);
     if t == 0 || e == 0 {
-        return Ok(out);
+        return Ok(());
     }
     let d = e / n_head;
-    let params = gpu.uniform(&AttentionParams {
+    let params = AttentionParams {
         t: t as u32,
         e: e as u32,
         d: d as u32,
         scale: 1.0 / (d as f32).sqrt(),
         start: start as u32,
         _pad: [0; 3],
-    });
-    gpu.dispatch(
-        &gpu.kernels.attention,
-        &[
-            &qkv.buffer,
-            &k_cache.buffer,
-            &v_cache.buffer,
-            &out.buffer,
-            &params,
-        ],
+    };
+    rec.dispatch(
+        &rec.gpu.kernels.attention,
+        &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer, &out.buffer],
+        bytemuck::bytes_of(&params),
         (t as u32, n_head as u32, 1),
-    );
-    Ok(out)
+    )
 }
 
 /// Causal multi-head attention from the fused `qkv: [T, 3E]` alone; returns `[T, E]`. Writes a
@@ -429,18 +563,18 @@ pub fn copy_with_max_groups(gpu: &Gpu, x: &GpuTensor, max_groups: u32) -> Result
             x.len()
         )));
     }
-    let out = gpu.alloc(x.shape());
-    if x.is_empty() {
-        return Ok(out);
-    }
-    elementwise(
-        gpu,
-        &gpu.kernels.copy,
-        &[&x.buffer, &out.buffer],
-        Params4::new(len_u32(x.len() / 4)?, 0, 0, 0),
-        max_groups,
-    );
-    Ok(out)
+    once(gpu, x.shape(), |rec, out| {
+        if x.is_empty() {
+            return Ok(());
+        }
+        elementwise(
+            rec,
+            &gpu.kernels.copy,
+            &[&x.buffer, &out.buffer],
+            Params4::new(len_u32(x.len() / 4)?, 0, 0, 0),
+            max_groups,
+        )
+    })
 }
 
 /// Fused multiply-adds per invocation and step of `fma_peak`: its 8 vec4 chains.
@@ -455,14 +589,14 @@ pub fn fma_peak(gpu: &Gpu, groups: u32, iters: u32) -> Result<GpuTensor> {
     if groups == 0 || groups > gpu.max_groups() {
         return Err(Error::Shape(format!("fma_peak: {groups} workgroups")));
     }
-    let out = gpu.alloc(&[n]);
-    let params = gpu.uniform(&Params4::new(iters, 0, 0, 0));
-    gpu.dispatch(
-        &gpu.kernels.fma_peak,
-        &[&out.buffer, &params],
-        (groups, 1, 1),
-    );
-    Ok(out)
+    once(gpu, &[n], |rec, out| {
+        rec.dispatch(
+            &gpu.kernels.fma_peak,
+            &[&out.buffer],
+            bytemuck::bytes_of(&Params4::new(iters, 0, 0, 0)),
+            (groups, 1, 1),
+        )
+    })
 }
 
 /// Workgroups `read_peak` launches: enough to fill the GPU, few enough that its one store per
@@ -481,29 +615,38 @@ pub fn read_peak(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
     let groups = READ_PEAK_GROUPS
         .min(x.len().div_ceil(4 * ELEMENTWISE_WG as usize))
         .max(1);
-    let out = gpu.alloc(&[groups * ELEMENTWISE_WG as usize * 4]);
-    let params = gpu.uniform(&Params4::new(len_u32(x.len() / 4)?, 0, 0, 0));
-    gpu.dispatch(
-        &gpu.kernels.read_peak,
-        &[&x.buffer, &out.buffer, &params],
-        (groups as u32, 1, 1),
-    );
-    Ok(out)
+    let params = Params4::new(len_u32(x.len() / 4)?, 0, 0, 0);
+    once(gpu, &[groups * ELEMENTWISE_WG as usize * 4], |rec, out| {
+        rec.dispatch(
+            &gpu.kernels.read_peak,
+            &[&x.buffer, &out.buffer],
+            bytemuck::bytes_of(&params),
+            (groups as u32, 1, 1),
+        )
+    })
 }
 
 /// Row `i` of `x: [R, C]` as a new `[1, C]` tensor: a buffer-to-buffer copy, no kernel (D26).
 pub fn row(gpu: &Gpu, x: &GpuTensor, i: usize) -> Result<GpuTensor> {
+    let &[_, c] = x.shape() else {
+        return Err(Error::Shape(format!("row: x {:?} must be 2-D", x.shape())));
+    };
+    once(gpu, &[1, c], |rec, out| row_into(rec, x, i, out))
+}
+
+/// `row` into `out: [1, C]` (D61).
+pub fn row_into(rec: &mut Rec, x: &GpuTensor, i: usize, out: &GpuTensor) -> Result<()> {
     let &[r, c] = x.shape() else {
         return Err(Error::Shape(format!("row: x {:?} must be 2-D", x.shape())));
     };
     if i >= r {
         return Err(Error::Shape(format!("row {i} of a {r}-row tensor")));
     }
-    let out = gpu.alloc(&[1, c]);
+    check_out("row", out, &[1, c])?;
     if c > 0 {
-        gpu.copy(&x.buffer, (i * c * 4) as u64, &out.buffer, (c * 4) as u64);
+        rec.copy(&x.buffer, (i * c * 4) as u64, &out.buffer, (c * 4) as u64);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Kernels index with u32 (WGSL has no 64-bit integers by default).

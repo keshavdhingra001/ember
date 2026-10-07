@@ -835,3 +835,73 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
     "% of the roofline" lines of `ember profile` aren't quoted from this run (one round shows
     134%, which is impossible: its copy measurement was low).
 
+
+## M7: Fusion and memory (approved 2026-10-08)
+
+Starting point (D57's clean rerun): a decode step is 135 dispatches, each with its own output
+buffer, uniform buffer, bind group, command encoder and submit; ~5.3 ms of each ~25.8 ms step is
+outside the kernels. Attention runs 12 workgroups in decode and takes 10.8 ms of the step at
+position 1000. The plan's estimates (to be measured, §4): ~1.5 ms outside kernels, decode at
+position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
+
+### D58: One command encoder and one submit per token
+- **What:** ops record into a `Rec` (one `wgpu::CommandEncoder`) instead of submitting. A token's
+  ~110 dispatches, the copy of the last row and the copy into the readback buffer go into one
+  encoder and one `queue.submit`. Each dispatch keeps its own compute pass, so the profiler's
+  per-pass timestamps work unchanged.
+- **Alternatives:** one pass for the whole token (fewer passes, but per-kernel timing then needs
+  `TIMESTAMP_QUERY_INSIDE_PASSES`); keep one submit per op.
+- **Why:** a submit costs tens of microseconds of driver work; 135 of them are a large part of
+  the 5.3 ms. Within one encoder wgpu still inserts the barriers between dependent dispatches.
+
+### D59: The cached path runs on a fixed workspace
+- **What:** a `Workspace` per model holds one buffer per intermediate (residual stream ×2,
+  LayerNorm output, qkv, attention output and its chunk partials, MLP hidden, last row, logits,
+  readback), each sized for `n_ctx` rows and allocated once. Tensors over it are views: shape
+  `[T, …]`, buffer larger (kernels bound by their params, never the buffer size, D9). Bind groups
+  and uniform buffers are cached by (kernel, bound buffers); a token only rewrites the uniforms
+  whose contents changed (the position) and the token id. Reusing one cache entry with different
+  contents within one recording is an error, because `write_buffer` lands before the whole
+  submit.
+- **Alternatives:** a size-keyed pool of free buffers (keeps the API, rebuilds bind groups every
+  token); trace a step once and replay it (wgpu can't replay compute command buffers).
+- **Why:** bind groups name buffers, so fixed buffers make every bind group reusable. `n_ctx`
+  sizing lets prefill use the same buffers as decode.
+
+### D60: "Zero allocations" means zero GPU object creations per token
+- **What:** `Gpu` counts the buffers and bind groups it creates. After the first decode step,
+  a step creates none (tested). Rust heap allocations and wgpu's internal staging memory (wgpu
+  allocates a staging chunk per `write_buffer` on native) are reported, not required to be zero.
+- **Alternatives:** zero heap allocations too (needs a counting allocator, and wgpu allocates
+  while recording).
+
+### D61: Ops record into a caller's `Rec`
+- **What:** each op has a form that takes a `Rec` and its output tensor. The existing functions
+  (`ops::linear(gpu, …)` etc.) become wrappers: allocate the output, record, submit. So per-kernel
+  tests, the uncached M3 path and the cached workspace path all run the same recording code.
+- **Alternatives:** a second implementation for the workspace path.
+
+### D62: The linear kernels end with an epilogue
+- **What:** an override constant `EPILOGUE` selects what happens after the bias: nothing, GELU
+  (the text of `gelu.wgsl`'s function, shared), or adding a residual input. `matmul`, `matvec`
+  and `matvec_rows` apply it the same way, so decode stays bitwise equal to recompute (D33).
+  `fc` uses GELU; `attn_out` and `fc_out` add the residual (f32 addition commutes, so
+  `x + y` is the same bits as the separate `add` kernel's). 135 → 99 dispatches before D63.
+- **Alternatives:** fuse LayerNorm too (harder, small gain); no fusion.
+
+### D63: Attention splits keys into chunks of 64 with an online softmax
+- **What:** pass 1, one workgroup per (query row, head, key chunk of 64): stage the chunk's keys
+  in shared memory with coalesced loads, score them, and write the chunk's max, sum of
+  exponentials and unnormalized output. Pass 2, one workgroup per (row, head): combine the chunks
+  in chunk order (rescale by `exp(m_c - m)`), then divide by the total. Chunks are fixed by
+  absolute key index, so a row's bits don't depend on the batch, and D33 still holds. The
+  1024-position shared-memory limit of D20 goes away.
+- **Alternatives:** one pass where the last workgroup combines (an atomic counter); full
+  FlashAttention-2 with tiles of queries for long prompts (prefill is short today; deferred).
+- **Why:** decode attention runs 12 workgroups today; at position 1000 this is 192.
+
+### D64: M7 tests
+- **What:** outputs into oversized buffers pre-filled with sentinels (D9): the elements past the
+  view must survive. Workspace path vs op-by-op path bitwise. Attention at chunk boundaries
+  (63, 64, 65, 1023, 1024 keys) and beyond 1024 against the CPU at the unchanged 1e-5. The
+  creation counter is zero for a steady-state decode step.

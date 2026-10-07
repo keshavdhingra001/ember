@@ -69,6 +69,22 @@ impl GpuTensor {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The first `numel(shape)` elements of this tensor's buffer as a tensor of `shape`, sharing
+    /// the buffer: what the workspace hands out (D59). Fails if they don't fit.
+    pub fn view(&self, shape: &[usize]) -> Result<GpuTensor> {
+        let n = numel(shape);
+        if (self.buffer.size() as usize) < n * 4 {
+            return Err(Error::Shape(format!(
+                "view {shape:?} doesn't fit a buffer of {} bytes",
+                self.buffer.size()
+            )));
+        }
+        Ok(GpuTensor {
+            shape: shape.to_vec(),
+            buffer: self.buffer.clone(),
+        })
+    }
 }
 
 /// Number of elements in a tensor of this shape (1 for the scalar shape `[]`).
