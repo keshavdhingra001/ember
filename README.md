@@ -10,15 +10,18 @@ median of 5 after a warm-up, wall clock). Logits are within 2.5e-6 (relative) of
 reference, and greedy text is identical. Every cached decode step is bit-for-bit equal to
 recomputing the whole sequence. The reference itself matches a float64 numpy implementation and
 Hugging Face's published output. Every kernel is differential-tested against the reference.
-Next: M5, per-kernel GPU timings.
+Per-kernel GPU timestamps (M5) show where the time goes: the naive matmul is 83–95% of every
+step, decode reaches 48% of the measured 26.7 GB/s copy bandwidth, and 14% of a decode step is
+submit/readback overhead rather than kernels (`ember profile`, DESIGN.md D42). Next: M6, a tiled
+matmul and a coalesced matrix-vector kernel.
 
 ## Approach
 - **CPU oracle.** A plain-Rust reference implementation of every op (and of the whole model) is
   the source of truth. Every GPU kernel is differential-tested against it with explicit tolerances.
 - **Deterministic.** Same device and inputs give bit-identical outputs: no float atomics, fixed
   reduction order, seeded sampling.
-- **Measured.** Every performance claim states its method: wall clock today (median of 5 after a
-  warm-up), per-kernel GPU timestamps from M5.
+- **Measured.** Every performance claim states its method: wall clock (median of 5 after a
+  warm-up) per step, and GPU timestamp queries per kernel.
 
 ## Try it
 ```bash
@@ -30,4 +33,5 @@ cargo run --release -- tokenize "Hello world"            # BPE, step by step
 cargo run --release -- generate -n 16 "I enjoy walking with my cute dog"        # on the GPU
 cargo run --release -- generate --cpu -n 16 "I enjoy walking with my cute dog"  # CPU reference
 cargo run --release -- bench -n 32 "I enjoy walking with my cute dog"           # prefill / decode timings
+cargo run --release -- profile "I enjoy walking with my cute dog"               # per-kernel GPU times
 ```

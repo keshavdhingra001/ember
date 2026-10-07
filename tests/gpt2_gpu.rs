@@ -135,6 +135,25 @@ fn cached_decode_is_bitwise_full_recompute() {
 }
 
 #[test]
+fn truncate_rewinds_to_an_exact_prefix() {
+    // Decode past position 6, rewind to 6, take a different branch: the logits must be exactly
+    // those of recomputing the new sequence, so no row past the cut leaks in.
+    let g = gpu();
+    let gw = GpuWeights::upload(g, &tiny_random());
+    let mut cache = KvCache::new(g, &gw.config);
+    let ids = [5, 0, 36, 17, 17, 2, 30, 11, 8];
+    gpt2_gpu::extend(g, &gw, &mut cache, &ids).unwrap();
+    cache.truncate(6).unwrap();
+    assert_eq!(cache.len(), 6);
+    let got = gpt2_gpu::extend(g, &gw, &mut cache, &[4]).unwrap();
+    let want = gpt2_gpu::next_logits(g, &gw, &[5, 0, 36, 17, 17, 2, 4]).unwrap();
+    assert_eq!(bits(&got), bits(&want));
+    assert!(cache.truncate(8).is_err());
+    cache.truncate(7).unwrap(); // to the current length: a no-op, not an error
+    assert_eq!(cache.len(), 7);
+}
+
+#[test]
 fn a_cache_for_another_model_is_rejected() {
     // Same width and context, one layer fewer: every per-layer shape check passes, so only the
     // layer count can tell. The cache must stay empty afterwards.

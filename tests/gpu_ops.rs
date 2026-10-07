@@ -339,6 +339,44 @@ fn row_copies_exactly() {
     assert!(ops::row(g, &gx, 4).is_err());
 }
 
+#[test]
+fn copy_kernel_is_exact() {
+    // Sizes around whole workgroups (256 vec4s each), more than 1024 vec4s, and a cap of 2
+    // workgroups so the grid-stride loop wraps several times; plus special values: a copy must
+    // move bits, not numbers.
+    let g = gpu();
+    for n in [4, 1020, 1024, 1028, 4 * 256 * 3 + 8, 4 * 5000] {
+        let x = random(&[n], -1.0, 1.0, n as u64);
+        let gx = g.upload(&x);
+        assert_eq!(g.read(&ops::copy(g, &gx).unwrap()).unwrap(), x, "n = {n}");
+        let capped = ops::copy_with_max_groups(g, &gx, 2).unwrap();
+        assert_eq!(g.read(&capped).unwrap(), x, "n = {n}, 2 workgroups");
+    }
+    let special = Tensor::new(
+        &[2, 4],
+        vec![
+            f32::NAN,
+            -0.0,
+            f32::INFINITY,
+            1e-40,
+            1.0,
+            -1.0,
+            f32::MIN,
+            f32::MAX,
+        ],
+    )
+    .unwrap();
+    let got = g.read(&ops::copy(g, &g.upload(&special)).unwrap()).unwrap();
+    let bits = |t: &Tensor| t.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&got), bits(&special));
+    assert!(ops::copy(g, &g.upload(&Tensor::zeros(&[6]))).is_err());
+    assert!(
+        g.read(&ops::copy(g, &g.upload(&Tensor::zeros(&[0]))).unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ------------------------------------------------------------------ KV cache (M4)
 
 /// Rows `lo..hi` of a 2-D host tensor.

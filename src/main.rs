@@ -11,10 +11,11 @@ use std::time::Instant;
 use ember::compare::{self, Tol};
 use ember::gpt2::gpu::{self as gpt2_gpu, GpuWeights, KvCache};
 use ember::gpt2::{self, Weights};
+use ember::profile::{self, KernelTime};
 use ember::rng::Rng;
 use ember::{Gpu, Tensor, Tokenizer, cpu, ops};
 
-const USAGE: &str = "usage: ember [info | selftest | tokenize <text>\n              | generate [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [-n <tokens>] <prompt>]";
+const USAGE: &str = "usage: ember [info | selftest | tokenize <text>\n              | generate [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [-n <tokens>] <prompt>\n              | profile [-n <runs>] <prompt>]";
 const GPT2_DIR: &str = "data/gpt2";
 
 fn main() -> ExitCode {
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
         Some("tokenize") if args.len() > 1 => tokenize(&args[1..].join(" ")),
         Some("generate") => generate(&args[1..]),
         Some("bench") => bench(&args[1..]),
+        Some("profile") => profile_cmd(&args[1..]),
         Some(other) => {
             eprintln!("unknown command or missing argument: `{other}`\n\n{USAGE}");
             return ExitCode::from(2);
@@ -290,9 +292,213 @@ fn bench(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn median(mut xs: Vec<f64>) -> f64 {
-    xs.sort_by(f64::total_cmp);
-    xs[xs.len() / 2]
+/// The median of a non-empty set of runs.
+fn median(xs: Vec<f64>) -> f64 {
+    profile::median(xs).expect("at least one measured run")
+}
+
+/// One measured step: every kernel's GPU time (D36) and the step's wall-clock time.
+struct Sample {
+    kernels: Vec<KernelTime>,
+    wall_ns: f64,
+}
+
+/// Run `step` with the profiler on. The wall clock stops when `step` returns, which for the
+/// model means after its logits were read back, so the GPU has finished.
+fn measure<T>(
+    gpu: &Gpu,
+    step: impl FnOnce() -> ember::Result<T>,
+) -> Result<(T, Sample), Box<dyn std::error::Error>> {
+    gpu.profile_start()?;
+    let t = Instant::now();
+    let out = step()?;
+    let wall_ns = t.elapsed().as_secs_f64() * 1e9;
+    let kernels = gpu.profile_finish()?;
+    Ok((out, Sample { kernels, wall_ns }))
+}
+
+/// Median per-step GPU ms of one kernel across samples (0 if it never ran).
+fn kernel_ms(samples: &[Sample], kernel: &str) -> f64 {
+    let per_run = samples.iter().map(|s| {
+        s.kernels
+            .iter()
+            .filter(|t| t.kernel == kernel)
+            .map(|t| t.ns)
+            .sum::<f64>()
+    });
+    median(per_run.collect()) / 1e6
+}
+
+/// Median total kernel ms and wall ms per step.
+fn step_ms(samples: &[Sample]) -> (f64, f64) {
+    let gpu = samples.iter().map(|s| s.kernels.iter().map(|t| t.ns).sum());
+    let wall = samples.iter().map(|s| s.wall_ns);
+    (median(gpu.collect()) / 1e6, median(wall.collect()) / 1e6)
+}
+
+/// The per-kernel table of D38: calls, median GPU ms and share of the step's wall clock.
+fn print_table(title: &str, samples: &[Sample]) {
+    let (gpu_ms, wall_ms) = step_ms(samples);
+    println!("\n{title}");
+    println!(
+        "  {:<12} {:>6} {:>10} {:>8}",
+        "kernel", "calls", "GPU ms", "% step"
+    );
+    let mut rows: Vec<(&str, usize, f64)> = profile::by_kernel(&samples[0].kernels)
+        .into_iter()
+        .map(|(k, calls, _)| (k, calls, kernel_ms(samples, k)))
+        .collect();
+    rows.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let calls: usize = rows.iter().map(|r| r.1).sum();
+    for (k, c, ms) in rows {
+        println!("  {k:<12} {c:>6} {ms:>10.3} {:>7.1}%", 100.0 * ms / wall_ms);
+    }
+    println!(
+        "  {:<12} {calls:>6} {gpu_ms:>10.3} {:>7.1}%",
+        "all kernels",
+        100.0 * gpu_ms / wall_ms
+    );
+    println!(
+        "  {:<12} {:>6} {wall_ms:>10.3}   (not in kernels: {:.3} ms of submits, copies, readback, CPU)",
+        "wall clock",
+        "",
+        wall_ms - gpu_ms
+    );
+}
+
+/// Bytes of weights a decode step reads: every tensor once, except `wpe`, of which it reads one
+/// row. (`wte` is read whole by the tied LM head.)
+fn decode_weight_bytes(w: &Weights) -> f64 {
+    let norm = |n: &gpt2::Norm| n.gain.len() + n.bias.len();
+    let lin = |l: &gpt2::Linear| l.w.len() + l.b.len();
+    let blocks: usize = w
+        .blocks
+        .iter()
+        .map(|b| {
+            norm(&b.ln_1)
+                + lin(&b.qkv)
+                + lin(&b.attn_out)
+                + norm(&b.ln_2)
+                + lin(&b.fc)
+                + lin(&b.fc_out)
+        })
+        .sum();
+    4.0 * (blocks + norm(&w.ln_f) + w.wte.len()) as f64
+}
+
+/// `ember profile [-n RUNS] <prompt>` (D36-D41): per-kernel tables for the prefill and one
+/// decode step, a decode sweep over context positions, and the measured copy bandwidth. Every
+/// number is the median of RUNS (default 5) after 1 warm-up.
+fn profile_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let Opts {
+        n: runs, prompt, ..
+    } = parse_opts(args, 5, &[])?;
+    if runs == 0 {
+        return Err("-n: at least one measured run".into());
+    }
+    let (_, w, ids) = load_gpt2(&prompt)?;
+    if ids.len() + 1 > w.config.n_ctx {
+        return Err(format!("the prompt needs at most {} tokens", w.config.n_ctx - 1).into());
+    }
+    let gpu = Gpu::new()?;
+    let gw = GpuWeights::upload(&gpu, &w);
+    let mut cache = KvCache::new(&gpu, &w.config);
+    let argmax = |l: &[f32]| -> ember::Result<u32> {
+        cpu::argmax(l)
+            .map(|i| i as u32)
+            .ok_or_else(|| ember::Error::Input("logits contain NaN".into()))
+    };
+    println!(
+        "{} ({:?}), {} {}; timestamp tick {} ns",
+        gpu.info.name,
+        gpu.info.backend,
+        gpu.info.driver,
+        gpu.info.driver_info,
+        gpu.queue.get_timestamp_period()
+    );
+    println!(
+        "prompt {:?} = {} tokens; median of {runs} after 1 warm-up; GPU time from timestamp queries, step time from the wall clock",
+        prompt,
+        ids.len()
+    );
+
+    // Prefill, then the first decode step right after it.
+    let (mut prefill, mut decode) = (Vec::new(), Vec::new());
+    for run in 0..=runs {
+        cache.clear();
+        let (next, p) = measure(&gpu, || {
+            argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &ids)?)
+        })?;
+        let (_, d) = measure(&gpu, || gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next]))?;
+        if run > 0 {
+            prefill.push(p);
+            decode.push(d);
+        }
+    }
+    print_table(&format!("prefill ({} tokens)", ids.len()), &prefill);
+    print_table(&format!("decode step at position {}", ids.len()), &decode);
+
+    // Context sweep (D40): fill the cache to position p once, then time one decode step there,
+    // rewinding the cache to p before each run.
+    println!("\ndecode vs context position");
+    println!(
+        "  {:>8} {:>10} {:>10} {:>12} {:>8}",
+        "position", "wall ms", "GPU ms", "attention ms", "% attn"
+    );
+    let filler: Vec<u32> = ids.iter().copied().cycle().take(w.config.n_ctx).collect();
+    for pos in [8, 128, 512, 1000] {
+        if pos >= w.config.n_ctx {
+            continue;
+        }
+        cache.clear();
+        let next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &filler[..pos])?)?;
+        let mut samples = Vec::new();
+        for run in 0..=runs {
+            cache.truncate(pos)?;
+            let (_, s) = measure(&gpu, || gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next]))?;
+            if run > 0 {
+                samples.push(s);
+            }
+        }
+        let (gpu_ms, wall_ms) = step_ms(&samples);
+        let attn = kernel_ms(&samples, "attention");
+        println!(
+            "  {pos:>8} {wall_ms:>10.3} {gpu_ms:>10.3} {attn:>12.3} {:>7.1}%",
+            100.0 * attn / gpu_ms
+        );
+    }
+
+    // Bandwidth roofline (D41): a 256 MiB copy kernel reads and writes every byte once.
+    let n = 64 << 20;
+    let src = gpu.upload(&Tensor::new(&[n], (0..n).map(|i| i as f32).collect())?);
+    let mut copies = Vec::new();
+    for run in 0..=runs {
+        let (out, s) = measure(&gpu, || ops::copy(&gpu, &src))?;
+        drop(out);
+        if run > 0 {
+            copies.push(s);
+        }
+    }
+    let copy_ms = kernel_ms(&copies, "copy");
+    let copy_gbs = 2.0 * (n * 4) as f64 / (copy_ms * 1e6);
+    let (decode_gpu_ms, decode_wall_ms) = step_ms(&decode);
+    let bytes = decode_weight_bytes(&w);
+    println!("\nbandwidth");
+    println!(
+        "  copy kernel     256 MiB read + 256 MiB written in {copy_ms:.3} ms = {copy_gbs:.1} GB/s (measured roofline)"
+    );
+    for (what, ms) in [
+        ("decode kernels", decode_gpu_ms),
+        ("decode wall", decode_wall_ms),
+    ] {
+        let gbs = bytes / (ms * 1e6);
+        println!(
+            "  {what:<16}{:.0} MB of weights in {ms:.3} ms = {gbs:.1} GB/s = {:.0}% of the roofline",
+            bytes / 1e6,
+            100.0 * gbs / copy_gbs
+        );
+    }
+    Ok(())
 }
 
 /// Remove and return the longest printable prefix of `buf`. A token can end halfway through a

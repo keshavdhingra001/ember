@@ -160,6 +160,20 @@ impl KvCache {
     pub fn clear(&mut self) {
         self.len = 0;
     }
+
+    /// Forget every position from `len` on, keeping the first `len` (the next token goes to
+    /// position `len`). Rows `0..len` are untouched, so they stay exactly what the prefix
+    /// computed; the rest are overwritten as the sequence grows again. Fails past the end.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        if len > self.len {
+            return Err(Error::Input(format!(
+                "truncate to {len}: the cache holds only {}",
+                self.len
+            )));
+        }
+        self.len = len;
+        Ok(())
+    }
 }
 
 /// Run `ids` at positions `cache.len()..` and append their K and V to the cache. Returns the

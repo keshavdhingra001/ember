@@ -449,3 +449,42 @@ allocates its output), f16 / quantized weights (M9), and the sampler beyond gree
 - **What:** a `copy` kernel (vec4 loads and stores, grid-stride) moves a 256 MiB buffer; bytes
   read + written over its timestamped GPU time gives achievable GB/s. Decode's weight bytes over
   its kernel time is then compared with that, not with a datasheet number.
+
+### D42: First per-kernel results
+`ember profile "I enjoy walking with my cute dog"` (2026-10-07, Iris Xe / Vulkan / Mesa 26.2.2,
+release build, 7-token prompt, median of 5 after 1 warm-up; GPU ms from timestamps, step ms
+from the wall clock):
+
+| Step | `linear` | attention | everything else | all kernels | wall clock | not in kernels |
+|---|---|---|---|---|---|---|
+| Prefill (7 tokens) | 127.3 ms (94.5%) | 0.32 ms | 0.63 ms | 128.3 ms | 134.7 ms | 6.4 ms |
+| Decode (position 7) | 37.3 ms (83.5%) | 0.36 ms | 0.53 ms | 38.3 ms | 44.7 ms | 6.4 ms |
+
+| Decode at position | 8 | 128 | 512 | 1000 |
+|---|---|---|---|---|
+| Wall ms/token | 43.9 | 43.2 | 44.8 | 49.4 |
+| Attention share of GPU time | 1.0% | 4.2% | 12.9% | 23.4% |
+
+Bandwidth: the copy kernel moves 256 MiB in and 256 MiB out in 20.1 ms = **26.7 GB/s**. A decode
+step reads 495 MB of weights: 12.9 GB/s over its kernel time, **48% of the measured roofline**
+(42% over wall time).
+
+A second invocation minutes later gave decode kernels 34.9 ms (52% of a 27.1 GB/s roofline),
+prefill 120.9 ms, 5.2–6.0 ms outside kernels, attention 22.3% at 1000: whole runs vary by ~8%
+(a laptop iGPU's clocks and thermals), while the shares and ratios hold. Comparisons between
+kernels (M6) are therefore made within one invocation.
+
+What this says:
+- **Matmul is the whole story** (83–95% of every step), so M6 is the right next milestone. Prefill's
+  `linear` time is 3.4× decode's for 7× the rows: the naive kernel rereads all of `w` for every
+  row instead of reusing it, which is what tiling fixes.
+- **Decode is far from the memory roof.** It reaches half of what a plain copy achieves, so a
+  coalesced matrix-vector kernel (M6) has up to ~2× left before bandwidth, not compute, caps it.
+- **6.4 ms per step (14% of decode) isn't GPU work:** 135 separate submits, 135 output
+  allocations, the row copy and the readback. That is M7's target (one encoder per token, a buffer
+  arena).
+- **Attention is small until the context is long:** O(t) per step, a quarter of decode GPU time
+  at 1000. The matmuls are fixed, so attention only becomes the target once they are fast.
+- **Caveat on the roofline:** 26.7 GB/s is what this copy kernel achieves, a lower bound on the
+  hardware's. The datasheet peak (LPDDR4x, ~50–68 GB/s) was not reached. The D35 note's "a fifth
+  of the bandwidth" was against the datasheet; against the measured number it is about half.

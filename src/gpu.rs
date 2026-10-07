@@ -39,6 +39,7 @@ pub(crate) struct Kernels {
     pub linear: Kernel,
     pub attention: Kernel,
     pub kv_write: Kernel,
+    pub copy: Kernel,
 }
 
 impl Gpu {
@@ -95,6 +96,7 @@ impl Gpu {
                 &with_reduce(include_str!("shaders/attention.wgsl")),
             ),
             kv_write: k("kv_write", include_str!("shaders/kv_write.wgsl")),
+            copy: k("copy", include_str!("shaders/copy.wgsl")),
         };
         Ok(Gpu {
             device,

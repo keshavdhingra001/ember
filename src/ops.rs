@@ -337,6 +337,36 @@ pub fn causal_attention(gpu: &Gpu, qkv: &GpuTensor, n_head: usize) -> Result<Gpu
     attention_cached(gpu, qkv, &k, &v, 0, n_head)
 }
 
+/// A copy of `x` made by a kernel, 16 bytes per load and store: the bandwidth probe (D41). The
+/// length must be a multiple of 4 (whole vec4s). For moving data, `Gpu::copy` / `row` are the
+/// tools; this exists to be timed.
+pub fn copy(gpu: &Gpu, x: &GpuTensor) -> Result<GpuTensor> {
+    copy_with_max_groups(gpu, x, gpu.limits.max_compute_workgroups_per_dimension)
+}
+
+/// `copy` with a cap on the workgroup count, so tests can exercise the grid-stride loop (as
+/// `add_with_max_groups`).
+pub fn copy_with_max_groups(gpu: &Gpu, x: &GpuTensor, max_groups: u32) -> Result<GpuTensor> {
+    if !x.len().is_multiple_of(4) {
+        return Err(Error::Shape(format!(
+            "copy: {} elements aren't whole vec4s",
+            x.len()
+        )));
+    }
+    let out = gpu.alloc(x.shape());
+    if x.is_empty() {
+        return Ok(out);
+    }
+    elementwise(
+        gpu,
+        &gpu.kernels.copy,
+        &[&x.buffer, &out.buffer],
+        Params4::new(len_u32(x.len() / 4)?, 0, 0, 0),
+        max_groups,
+    );
+    Ok(out)
+}
+
 /// Row `i` of `x: [R, C]` as a new `[1, C]` tensor: a buffer-to-buffer copy, no kernel (D26).
 pub fn row(gpu: &Gpu, x: &GpuTensor, i: usize) -> Result<GpuTensor> {
     let &[r, c] = x.shape() else {
