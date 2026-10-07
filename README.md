@@ -5,8 +5,8 @@ shaders. It runs natively on Vulkan (developed on an Intel Iris Xe iGPU), and th
 in the browser via wasm too.
 
 **Status:** M0–M6 done. GPT-2 124M runs end to end on the GPU (Intel Iris Xe, Vulkan) with a
-KV cache, at **35.8 tokens/s decode** and 56 ms prefill for a 7-token prompt (`ember bench`,
-median of 5 after a warm-up, wall clock). Logits are within 2.5e-6 (relative) of a plain-Rust CPU
+KV cache, at **37.6 tokens/s decode** and 34 ms prefill for a 7-token prompt (`ember bench`,
+median of 5 after a warm-up, wall clock; median over 5 rounds). Logits are within 2.5e-6 (relative) of a plain-Rust CPU
 reference, and greedy text is identical. Every cached decode step is bit-for-bit equal to
 recomputing the whole sequence. The reference itself matches a float64 numpy implementation and
 Hugging Face's published output. Every kernel is differential-tested against the reference.
@@ -15,8 +15,11 @@ M6 replaced the naive matmul with a shared-memory tiled kernel for prefill (up t
 39× naive, against a measured 1431 GFLOP/s compute roof) and a coalesced matrix-vector kernel
 for decode (73% of the measured 29.6 GB/s read bandwidth over a step's weights). Against the
 pre-M6 build, run back to back: decode 25.3 → 35.8 tokens/s, prefill 129 → 58 ms (`ember
-profile`, `ember bench`, `ember matmul`; DESIGN.md D50). Next: M7, one command encoder per
-token and reused buffers (~5 ms of each 28 ms decode step is outside the kernels).
+profile`, `ember bench`, `ember matmul`; DESIGN.md D50). A follow-up split the reduction over K
+for the narrow decode matrices and gave short prompts a multi-row matrix-vector kernel, keeping
+the same summation order so cached decode stays bitwise equal to recompute: decode 34.1 → 37.6
+tokens/s, 7-token prefill 58 → 34 ms (D51–D57). Next: M7, one command encoder per token and
+reused buffers (~5 ms of each 26 ms decode step is outside the kernels).
 
 ## Approach
 - **CPU oracle.** A plain-Rust reference implementation of every op (and of the whole model) is

@@ -668,6 +668,10 @@ Model level: `ember profile` and `ember bench -n 32` on the 7-token prompt, the 
     also allows them to land elsewhere in the same buffer, so the check stays (like D22's gelu
     clamp).
 
+- **Later (D56, D57):** the split-K follow-up took decode to 37.6 tokens/s and the 7-token
+  prefill to 34 ms, measured on a quiet machine against the same pre-split binary (table at the
+  end of D57). The numbers above are M6's own and stay as they were.
+
 ## M6 follow-up: split-K (approved and built 2026-10-07)
 
 D50 left two gaps with one cause, too few threads: the 768-output matvecs run at 50% of the
@@ -768,7 +772,8 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
 
   The gain is smaller than D55's estimate (attn_out + fc_out 9.6 → 5.5 ms, step ~24 ms):
   the split matrices went from ~9.5 to ~6.1 ms in `ember matmul`, but less inside the model.
-  The wall-clock tokens/s needs a rerun on a quiet machine before it goes in the README.
+  The wall-clock numbers were rerun on a quiet machine on 2026-10-08: see the table at the end
+  of D57.
 
 ### D57: Up to 8 rows run a multi-row matvec
 - **What:** `matvec_rows.wgsl` is the matvec with up to 8 rows per thread: one partial per row
@@ -802,4 +807,31 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
   - No window bound inside a partial last chunk: the extra k values have x staged as 0, and
     `fma(0, w, p) = p` for any finite w. Equivalent; the bound only skips work (like D46).
   - Adding the empty chunks of a partial last round: +0 each. Equivalent (D56).
+- **Clean wall-clock rerun (2026-10-08, D56 and D57 together):** the pre-split binary
+  (`06f483c`), D56 (`5a59bc7`) and D57 (`e350141`), each running `ember profile` then `ember
+  bench -n 32` on the 7-token prompt, in that order, for 16 rounds over two sessions (6 before, 5
+  D56, 5 D57 with a bench line). No other job used the GPU or the CPU (load average 1.0–2.1 from
+  the runs themselves; one last round at 3.3). Each number is the median over rounds of each
+  binary's own median of 5 after 1 warm-up; the range across rounds is in brackets.
+
+  | | Before | D56 | D57 |
+  |---|---|---|---|
+  | Decode, `bench` | 34.1 tokens/s [32.5–36.4] | **37.6 tokens/s** [35.5–39.1] | 37.8 tokens/s [31.7–38.5] |
+  | Decode step, kernels (`profile`) | 25.0 ms [23.3–26.4] | 20.5 ms [19.6–22.3] | 20.9 ms [20.5–26.5] |
+  | Decode step, wall (`profile`) | 30.6 ms | 25.8 ms | 26.7 ms |
+  | Prefill (7 tokens), `bench` | 58.3 ms | 57.3 ms | **34.0 ms** [32.9–36.4] |
+  | Prefill, kernels (`profile`) | 54.0 ms | 51.1 ms | 28.2 ms |
+
+  - Decode: −18% kernel time, +10% tokens/s (D56). D57 doesn't touch the T = 1 path, so its
+    decode column measures the same code as D56's; their difference (20.5 vs 20.9 ms) shows the
+    noise between rounds. Pooled over both, decode is 37.7 tokens/s.
+  - Prefill: D57 is 1.7× faster in wall clock (58.3 → 34.0 ms), 1.9× in kernel time. D56's
+    3 ms prefill drop is within the range of the before column, so it isn't claimed.
+  - About 5–6 ms of every decode step is still outside the kernels (M7).
+  - The order was fixed (before, D56, D57), so D57 always ran last in a round, after two
+    binaries had warmed the GPU. Its worst round (31.7 tokens/s, kernels 26.5 ms) was the last
+    of the run, at load 3.3. A rotating order would remove that bias.
+  - The copy kernel's bandwidth varied from 18.8 to 27.4 GB/s across rounds, so the
+    "% of the roofline" lines of `ember profile` aren't quoted from this run (one round shows
+    134%, which is impossible: its copy measurement was low).
 
