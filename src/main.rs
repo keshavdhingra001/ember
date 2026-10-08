@@ -1,23 +1,118 @@
 //! `ember` CLI: `info` (what GPU we got), `selftest` (GPU add vs the CPU reference),
-//! `tokenize` (GPT-2's BPE, step by step), `generate` (greedy GPT-2 on the GPU with a KV cache,
-//! or without one, or on the CPU reference), `bench` (prefill and decode timings, D35),
-//! `profile` (per-kernel GPU times, D36-D41) and `matmul` (the linear kernels vs the roofs, D47).
-//! Wall-clock timing lives here, in the CLI, never in the engine (D4).
+//! `tokenize` (BPE, step by step), `generate` (greedy decoding on the GPU with a KV cache, or
+//! without one, or on the CPU reference), `bench` (prefill and decode timings, D35), `profile`
+//! (per-kernel GPU times, D36-D41) and `matmul` (the linear kernels vs the roofs, D47). The model
+//! commands take `--model gpt2 | smollm2-135m` (D74; GPT-2 by default). Wall-clock timing lives
+//! here, in the CLI, never in the engine (D4).
 
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use ember::cache::{CacheModel, KvCache};
 use ember::compare::{self, Tol};
-use ember::gpt2::gpu::{self as gpt2_gpu, GpuWeights, KvCache};
-use ember::gpt2::{self, Weights};
+use ember::gpt2;
+use ember::gpt2::gpu as gpt2_gpu;
+use ember::llama::{self, gpu as llama_gpu};
 use ember::profile::{self, KernelTime};
 use ember::rng::Rng;
 use ember::{Gpu, GpuTensor, Tensor, Tokenizer, cpu, ops};
 
-const USAGE: &str = "usage: ember [info | selftest | tokenize <text>\n              | generate [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [-n <tokens>] <prompt>\n              | profile [-n <runs>] <prompt>\n              | matmul [-n <runs>]]";
-const GPT2_DIR: &str = "data/gpt2";
+const USAGE: &str = "usage: ember [info | selftest | tokenize [--model M] <text>\n              | generate [--model M] [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [--model M] [-n <tokens>] <prompt>\n              | profile [--model M] [-n <runs>] <prompt>\n              | matmul [-n <runs>]]\n       M: gpt2 (default) | smollm2-135m";
+
+/// The models the CLI knows, and where their files live (fetched by scripts/fetch_*.sh).
+const MODELS: [(&str, &str); 2] = [("gpt2", "data/gpt2"), ("smollm2-135m", "data/smollm2-135m")];
+
+/// A model's CPU weights: the reference, and the source of the GPU upload.
+enum Model {
+    Gpt2(gpt2::Weights),
+    Llama(llama::Weights),
+}
+
+/// A model's weights on the GPU.
+enum GpuModel {
+    Gpt2(gpt2_gpu::GpuWeights),
+    Llama(llama_gpu::GpuWeights),
+}
+
+/// The tokenizer and weights of model `name`, and the prompt's token ids.
+fn load_model(name: &str, prompt: &str) -> CliResult<(Tokenizer, Model, Vec<u32>)> {
+    let (dir, tok) = load_tokenizer(name)?;
+    let model = if name == "gpt2" {
+        Model::Gpt2(gpt2::Weights::load(dir)?)
+    } else {
+        Model::Llama(llama::Weights::load(dir)?)
+    };
+    let ids = tok.encode(prompt)?;
+    Ok((tok, model, ids))
+}
+
+impl Model {
+    fn generate_cpu(&self, ids: &[u32], n: usize, on: impl FnMut(u32)) -> ember::Result<Vec<u32>> {
+        match self {
+            Model::Gpt2(w) => gpt2::generate_greedy(w, ids, n, on),
+            Model::Llama(w) => llama::generate_greedy(w, ids, n, on),
+        }
+    }
+
+    fn upload(&self, gpu: &Gpu) -> ember::Result<GpuModel> {
+        Ok(match self {
+            Model::Gpt2(w) => GpuModel::Gpt2(gpt2_gpu::GpuWeights::upload(gpu, w)?),
+            Model::Llama(w) => GpuModel::Llama(llama_gpu::GpuWeights::upload(gpu, w)?),
+        })
+    }
+
+    /// Positions a run with the default KV cache can use (D76).
+    fn n_ctx(&self) -> usize {
+        match self {
+            Model::Gpt2(w) => w.config.default_ctx(),
+            Model::Llama(w) => w.config.default_ctx(),
+        }
+    }
+
+    /// Bytes of weights one decode step reads: every tensor once (the tied LM head reads the
+    /// token table whole), except GPT-2's position table, of which it reads one row.
+    fn decode_bytes(&self) -> f64 {
+        let floats = match self {
+            Model::Gpt2(w) => w.param_count() - w.wpe.len(),
+            Model::Llama(w) => w.param_count(),
+        };
+        4.0 * floats as f64
+    }
+}
+
+impl GpuModel {
+    fn new_cache(&self, gpu: &Gpu) -> KvCache {
+        match self {
+            GpuModel::Gpt2(w) => KvCache::new(gpu, &w.config),
+            GpuModel::Llama(w) => KvCache::new(gpu, &w.config),
+        }
+    }
+
+    fn extend(&self, gpu: &Gpu, cache: &mut KvCache, ids: &[u32]) -> ember::Result<Vec<f32>> {
+        match self {
+            GpuModel::Gpt2(w) => gpt2_gpu::extend(gpu, w, cache, ids),
+            GpuModel::Llama(w) => llama_gpu::extend(gpu, w, cache, ids),
+        }
+    }
+
+    fn generate(
+        &self,
+        gpu: &Gpu,
+        ids: &[u32],
+        n: usize,
+        cached: bool,
+        on: impl FnMut(u32),
+    ) -> ember::Result<Vec<u32>> {
+        match (self, cached) {
+            (GpuModel::Gpt2(w), true) => gpt2_gpu::generate_greedy(gpu, w, ids, n, on),
+            (GpuModel::Gpt2(w), false) => gpt2_gpu::generate_greedy_uncached(gpu, w, ids, n, on),
+            (GpuModel::Llama(w), true) => llama_gpu::generate_greedy(gpu, w, ids, n, on),
+            (GpuModel::Llama(w), false) => llama_gpu::generate_greedy_uncached(gpu, w, ids, n, on),
+        }
+    }
+}
 
 type CliResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -26,7 +121,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         None | Some("info") => info(),
         Some("selftest") => selftest(),
-        Some("tokenize") if args.len() > 1 => tokenize(&args[1..].join(" ")),
+        Some("tokenize") if args.len() > 1 => tokenize(&args[1..]),
         Some("generate") => generate(&args[1..]),
         Some("bench") => bench(&args[1..]),
         Some("profile") => profile_cmd(&args[1..]),
@@ -98,9 +193,12 @@ fn selftest() -> CliResult {
     Ok(())
 }
 
-/// Print each pre-split word and the tokens BPE made of it.
-fn tokenize(text: &str) -> CliResult {
-    let tok = Tokenizer::load(Path::new(GPT2_DIR))?;
+/// Print each pre-split word and the tokens BPE made of it. (Special tokens such as
+/// `<|im_start|>` are matched before the split, so here they show up as plain text.)
+fn tokenize(args: &[String]) -> CliResult {
+    let o = prompt_opts(args, 0, &[])?;
+    let (_, tok) = load_tokenizer(&o.model)?;
+    let text = o.prompt.as_str();
     let mut total = 0;
     for word in tok.split(text)? {
         let ids = tok.encode(word)?;
@@ -120,7 +218,7 @@ fn tokenize(text: &str) -> CliResult {
     Ok(())
 }
 
-/// Greedy GPT-2, streaming tokens as they come: on the GPU with a KV cache (D29), on the GPU
+/// Greedy decoding, streaming tokens as they come: on the GPU with a KV cache (D29), on the GPU
 /// recomputing everything with `--no-cache` (M3), or on the CPU reference with `--cpu`.
 fn generate(args: &[String]) -> CliResult {
     let Opts {
@@ -128,8 +226,9 @@ fn generate(args: &[String]) -> CliResult {
         cpu: cpu_ref,
         no_cache,
         prompt,
+        model,
     } = prompt_opts(args, 20, &["--cpu", "--no-cache"])?;
-    let (tok, w, ids) = load_gpt2(&prompt)?;
+    let (tok, w, ids) = load_model(&model, &prompt)?;
 
     let mut pending = Vec::new();
     let on_token = |id: u32| {
@@ -141,20 +240,16 @@ fn generate(args: &[String]) -> CliResult {
         print!("{prompt}");
         std::io::stdout().flush()?;
         let start = Instant::now();
-        let out = gpt2::generate_greedy(&w, &ids, n, on_token)?;
+        let out = w.generate_cpu(&ids, n, on_token)?;
         let secs = start.elapsed().as_secs_f64();
         (out, secs, "CPU reference, no KV cache".to_string())
     } else {
         let gpu = Gpu::new()?;
-        let gw = GpuWeights::upload(&gpu, &w)?;
+        let gw = w.upload(&gpu)?;
         print!("{prompt}");
         std::io::stdout().flush()?;
         let start = Instant::now();
-        let out = if no_cache {
-            gpt2_gpu::generate_greedy_uncached(&gpu, &gw, &ids, n, on_token)?
-        } else {
-            gpt2_gpu::generate_greedy(&gpu, &gw, &ids, n, on_token)?
-        };
+        let out = gw.generate(&gpu, &ids, n, !no_cache, on_token)?;
         let secs = start.elapsed().as_secs_f64();
         let mode = if no_cache { "no KV cache" } else { "KV cache" };
         (out, secs, format!("{}, {mode}", gpu.info.name))
@@ -169,13 +264,21 @@ fn generate(args: &[String]) -> CliResult {
     Ok(())
 }
 
-/// The tokenizer and weights from `data/gpt2/`, and the prompt's token ids.
-fn load_gpt2(prompt: &str) -> CliResult<(Tokenizer, Weights, Vec<u32>)> {
-    let dir = Path::new(GPT2_DIR);
-    let tok = Tokenizer::load(dir)?;
-    let w = Weights::load(dir)?;
-    let ids = tok.encode(prompt)?;
-    Ok((tok, w, ids))
+/// Model `name`'s directory and tokenizer.
+fn load_tokenizer(name: &str) -> CliResult<(&'static Path, Tokenizer)> {
+    let Some(&(_, dir)) = MODELS.iter().find(|(n, _)| *n == name) else {
+        let names: Vec<&str> = MODELS.iter().map(|m| m.0).collect();
+        return Err(format!("unknown model `{name}`: one of {}", names.join(", ")).into());
+    };
+    let dir = Path::new(dir);
+    // GPT-2 keeps OpenAI's plain-text handling of `<|endoftext|>` (D11); the others follow
+    // their tokenizer.json (D75).
+    let tok = if name == "gpt2" {
+        Tokenizer::load(dir)?
+    } else {
+        Tokenizer::load_hf(dir)?
+    };
+    Ok((dir, tok))
 }
 
 /// Options before the prompt. `-n` and the flags a command allows come first, in any order;
@@ -185,6 +288,8 @@ struct Opts {
     cpu: bool,
     no_cache: bool,
     prompt: String,
+    /// `--model <name>`; `gpt2` by default.
+    model: String,
 }
 
 fn parse_opts(args: &[String], default_n: usize, flags: &[&str]) -> CliResult<Opts> {
@@ -193,6 +298,7 @@ fn parse_opts(args: &[String], default_n: usize, flags: &[&str]) -> CliResult<Op
         cpu: false,
         no_cache: false,
         prompt: String::new(),
+        model: "gpt2".into(),
     };
     let mut rest = args;
     loop {
@@ -202,6 +308,11 @@ fn parse_opts(args: &[String], default_n: usize, flags: &[&str]) -> CliResult<Op
                 rest = tail;
             }
             [flag] if flag == "-n" => return Err("-n needs a count".into()),
+            [flag, v, tail @ ..] if flag == "--model" => {
+                o.model = v.clone();
+                rest = tail;
+            }
+            [flag] if flag == "--model" => return Err("--model needs a name".into()),
             [flag, tail @ ..] if flags.contains(&flag.as_str()) => {
                 match flag.as_str() {
                     "--cpu" => o.cpu = true,
@@ -249,21 +360,23 @@ fn device(gpu: &Gpu) -> String {
 /// the uncached rate for comparison. 1 warm-up run, then the median of 5, wall clock.
 fn bench(args: &[String]) -> CliResult {
     const RUNS: usize = 5;
-    let Opts { n, prompt, .. } = prompt_opts(args, 32, &[])?;
-    let (_, w, ids) = load_gpt2(&prompt)?;
+    let Opts {
+        n, prompt, model, ..
+    } = prompt_opts(args, 32, &[])?;
+    let (_, w, ids) = load_model(&model, &prompt)?;
     // The uncached run generates n + 1 tokens after the prompt. The greedy loop would quietly
     // stop at the context length and the rates below would then divide by the wrong count.
-    if n == 0 || ids.len() + n + 1 > w.config.n_ctx {
+    if n == 0 || ids.len() + n + 1 > w.n_ctx() {
         return Err(format!(
             "bench needs 1 <= n and prompt + n + 1 <= {} tokens (prompt is {}, n is {n})",
-            w.config.n_ctx,
+            w.n_ctx(),
             ids.len()
         )
         .into());
     }
     let gpu = Gpu::new()?;
-    let gw = GpuWeights::upload(&gpu, &w)?;
-    let mut cache = KvCache::new(&gpu, &w.config);
+    let gw = w.upload(&gpu)?;
+    let mut cache = gw.new_cache(&gpu);
     let argmax = gpt2::argmax_token;
 
     // One cached run: (prefill seconds, decode seconds for n tokens). The decode clock covers
@@ -271,11 +384,11 @@ fn bench(args: &[String]) -> CliResult {
     let mut cached = || -> CliResult<(f64, f64)> {
         cache.clear();
         let t0 = Instant::now();
-        let mut next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &ids)?)?;
+        let mut next = argmax(&gw.extend(&gpu, &mut cache, &ids)?)?;
         let prefill = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
         for _ in 0..n {
-            next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next])?)?;
+            next = argmax(&gw.extend(&gpu, &mut cache, &[next])?)?;
         }
         Ok((prefill, t1.elapsed().as_secs_f64()))
     };
@@ -290,7 +403,7 @@ fn bench(args: &[String]) -> CliResult {
 
     let uncached = || -> CliResult<f64> {
         let t = Instant::now();
-        gpt2_gpu::generate_greedy_uncached(&gpu, &gw, &ids, n + 1, |_| {})?;
+        gw.generate(&gpu, &ids, n + 1, false, |_| {})?;
         Ok(t.elapsed().as_secs_f64())
     };
     uncached()?;
@@ -421,16 +534,20 @@ fn print_table(title: &str, samples: &[Sample]) {
 /// number is the median of RUNS (default 5) after 1 warm-up.
 fn profile_cmd(args: &[String]) -> CliResult {
     let Opts {
-        n: runs, prompt, ..
+        n: runs,
+        prompt,
+        model,
+        ..
     } = prompt_opts(args, 5, &[])?;
     let runs = measured_runs(runs)?;
-    let (_, w, ids) = load_gpt2(&prompt)?;
-    if ids.len() + 1 > w.config.n_ctx {
-        return Err(format!("the prompt needs at most {} tokens", w.config.n_ctx - 1).into());
+    let (_, w, ids) = load_model(&model, &prompt)?;
+    let n_ctx = w.n_ctx();
+    if ids.len() + 1 > n_ctx {
+        return Err(format!("the prompt needs at most {} tokens", n_ctx - 1).into());
     }
     let gpu = Gpu::new()?;
-    let gw = GpuWeights::upload(&gpu, &w)?;
-    let mut cache = KvCache::new(&gpu, &w.config);
+    let gw = w.upload(&gpu)?;
+    let mut cache = gw.new_cache(&gpu);
     let argmax = gpt2::argmax_token;
     println!(
         "{}; timestamp tick {} ns",
@@ -447,10 +564,8 @@ fn profile_cmd(args: &[String]) -> CliResult {
     let (mut prefill, mut decode) = (Vec::new(), Vec::new());
     for run in 0..=runs {
         cache.clear();
-        let (next, p) = measure(&gpu, || {
-            argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &ids)?)
-        })?;
-        let (_, d) = measure(&gpu, || gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next]))?;
+        let (next, p) = measure(&gpu, || argmax(&gw.extend(&gpu, &mut cache, &ids)?))?;
+        let (_, d) = measure(&gpu, || gw.extend(&gpu, &mut cache, &[next]))?;
         if run > 0 {
             prefill.push(p);
             decode.push(d);
@@ -466,16 +581,16 @@ fn profile_cmd(args: &[String]) -> CliResult {
         "  {:>8} {:>10} {:>10} {:>12} {:>8}",
         "position", "wall ms", "GPU ms", "attention ms", "% attn"
     );
-    let filler: Vec<u32> = ids.iter().copied().cycle().take(w.config.n_ctx).collect();
+    let filler: Vec<u32> = ids.iter().copied().cycle().take(n_ctx).collect();
     for pos in [8, 128, 512, 1000] {
-        if pos >= w.config.n_ctx {
+        if pos >= n_ctx {
             continue;
         }
         cache.clear();
-        let next = argmax(&gpt2_gpu::extend(&gpu, &gw, &mut cache, &filler[..pos])?)?;
+        let next = argmax(&gw.extend(&gpu, &mut cache, &filler[..pos])?)?;
         let samples = sample_runs(&gpu, runs, || {
             cache.truncate(pos)?;
-            gpt2_gpu::extend(&gpu, &gw, &mut cache, &[next])
+            gw.extend(&gpu, &mut cache, &[next])
         })?;
         let (gpu_ms, wall_ms) = step_ms(&samples);
         // Both passes of D63.
@@ -491,9 +606,7 @@ fn profile_cmd(args: &[String]) -> CliResult {
     let copy_ms = gpu_ms(&gpu, runs, || ops::copy(&gpu, &src))?;
     let copy_gbs = giga_per_s(2.0 * (PROBE_LEN * 4) as f64, copy_ms);
     let (decode_gpu_ms, decode_wall_ms) = step_ms(&decode);
-    // Bytes of weights a decode step reads: every tensor once, except `wpe`, of which it reads
-    // one row. (`wte` is read whole by the tied LM head.)
-    let bytes = 4.0 * (w.param_count() - w.wpe.len()) as f64;
+    let bytes = w.decode_bytes();
     println!("\nbandwidth");
     println!(
         "  copy kernel     256 MiB read + 256 MiB written in {copy_ms:.3} ms = {copy_gbs:.1} GB/s (measured roofline)"
@@ -720,6 +833,24 @@ mod tests {
         // After the first prompt word, `-n` is text. A lone `-` word is text too.
         let o = parse_opts(&args("say -n - twice"), 20, &[]).unwrap();
         assert_eq!((o.n, o.prompt.as_str()), (20, "say -n - twice"));
+    }
+
+    #[test]
+    fn model_is_an_option_with_a_value() {
+        let flags = ["--cpu", "--no-cache"];
+        let o = parse_opts(&args("--model smollm2-135m -n 3 hi"), 20, &flags).unwrap();
+        assert_eq!(
+            (o.model.as_str(), o.n, o.prompt.as_str()),
+            ("smollm2-135m", 3, "hi")
+        );
+        assert_eq!(parse_opts(&args("hi"), 20, &flags).unwrap().model, "gpt2");
+        assert!(parse_opts(&args("--model"), 20, &flags).is_err());
+        // After the prompt starts, `--model` is text.
+        let o = parse_opts(&args("say --model x"), 20, &flags).unwrap();
+        assert_eq!(
+            (o.model.as_str(), o.prompt.as_str()),
+            ("gpt2", "say --model x")
+        );
     }
 
     #[test]
