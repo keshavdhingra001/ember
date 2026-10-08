@@ -841,7 +841,7 @@ read roof, and the 7-token prefill's matmuls cost about 3 decode steps.
 Starting point (D57's clean rerun): a decode step is 135 dispatches, each with its own output
 buffer, uniform buffer, bind group, command encoder and submit; ~5.3 ms of each ~25.8 ms step is
 outside the kernels. Attention runs 12 workgroups in decode and takes 10.8 ms of the step at
-position 1000. The plan's estimates (to be measured, §4): ~1.5 ms outside kernels, decode at
+position 1000. The plan's estimates (measured in §4: D66): ~1.5 ms outside kernels, decode at
 position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
 
 ### D58: One command encoder and one submit per token
@@ -966,3 +966,46 @@ position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
 - **Result:** the stress test 0 bad in 6 runs, `gpu_ops` 0 failures in 20 runs. Creation counts
   (D60) are unchanged; the cached decode step allocates nothing, so it can't be slower. Worth
   an upstream report with the stress test as the repro.
+
+### D66: M7 results (measured 2026-10-08)
+- **Method:** four binaries, `before` (`e452e1a`, M6 + split-K), s2 (`09b2117`, §1 + §2), s3
+  (`194e416`, §3) and s4 (`c4e21b6`, §3 with the staging fix), each running `ember profile` and
+  `ember bench -n 32` on the 7-token prompt, 4 rounds in rotating order; medians of the 4
+  rounds (each round is itself a median of 5 after a warm-up). The machine was under load
+  (load average 10 → 2.5, another project's fuzzer), so differences under ~5% are noise.
+  Raw output: `target/tmp/m7/bench2.out` (not committed).
+
+| median of 4 rounds | before | s2 | s3 | s4 |
+|---|---|---|---|---|
+| decode tokens/s | 36.8 | 42.4 | 41.2 | 42.0 |
+| 7-token prefill ms | 34.9 | 31.2 | 31.5 | 30.8 |
+| decode: outside kernels ms | 5.43 | 4.24 | 4.84 | 4.64 |
+| decode at position 1000: attention ms | 11.2 | 10.5 | 5.7 | 5.5 |
+| decode at position 1000: wall ms | 37.8 | 34.3 | 29.3 | 29.0 |
+| 7-token prefill: attention ms (12 layers) | 0.32 | 0.30 | 0.82 | 0.49 |
+
+- **Decode:** 36.8 → 42.0 tokens/s (+14%), mostly from §1 + §2 (one submit per token, the
+  fixed workspace, 135 → 99 dispatches). §3 adds 12 dispatches (the combine, 111 in all) and
+  does not speed up a decode step at position 8, where attention is 2% of the step.
+- **Long context:** at position 1000 attention takes 11.2 → 5.5 ms and the step 37.8 → 29.0 ms
+  (−23%): 192 workgroups instead of 12. Attention is then 21% of the GPU time (35% before).
+- **Where a decode step goes now (s4, 4 rounds):** the linear kernels are 71–82% of the wall
+  time and 91–97% of the GPU time. They stream the 495 MB of weights at 24.5–25.5 GB/s: above
+  the copy kernel's 23.7–24.4 GB/s measured in the same runs (a copy reads and writes the same
+  number of bytes; decode mostly reads), and about 83–86% of the 29.6 GB/s read-only peak
+  measured in M6 (a different session, so approximate).
+- **No-cache path:** the 64 → 84 ms/token in the first measurement was the benchmark holding
+  the KV cache allocated (D63, fixed in `bench`). Paired after the fix: +4 ms (6%) over s2.
+- **Against the plan (stated before building):**
+  - Time outside the kernels: planned ~1.5 ms, measured 4.6 ms. §1 + §2 together saved
+    ~1.2 ms, not ~4. Not broken down further; the remaining parts (the 201 KB logits readback
+    and its map/poll wait, recording 111 passes, the host argmax) have not been timed
+    separately, so which one dominates is open.
+  - Decode at position 8: planned ~21 ms (~47 tokens/s), measured 23.8 ms (42.0 tokens/s); the
+    kernels came in as planned, the miss is the outside time above.
+  - Attention at position 1000: planned 3–4 ms, measured 5.5 ms. Not profiled inside the
+    kernel; candidates are the values read from global memory (not staged) and the second pass's
+    launch. Unverified.
+  - Short prefills got slower in attention (0.30 → 0.49 ms over 12 layers; 0.82 before the
+    staging fix): a 7-token row still runs a 64-thread workgroup per chunk and a second pass.
+    0.2 ms of a 31 ms prefill.
