@@ -50,7 +50,7 @@ pub struct Tokenizer {
     pattern: Regex,
     /// Split every digit into its own piece before the regex (D75; off for GPT-2).
     split_digits: bool,
-    /// Special tokens matched whole in the input, longest first (D75; none for GPT-2, D11).
+    /// Special tokens matched whole in the input (D75; none for GPT-2, D11).
     special: Vec<(String, u32)>,
 }
 
@@ -211,8 +211,7 @@ impl Tokenizer {
             }
             special.push((text.to_string(), id as u32));
         }
-        // Longest first, so a special token that is a prefix of another can't shadow it.
-        special.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+        // No ordering needed: `encode` takes the earliest match, and the longest one there.
         self.special = special;
         Ok(())
     }
