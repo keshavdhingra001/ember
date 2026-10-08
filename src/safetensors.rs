@@ -145,7 +145,7 @@ impl SafeTensors {
         self.entries.get(name)
     }
 
-    /// Copy one F32 tensor out of the file. Each 4-byte group is decoded with `from_le_bytes`:
+    /// Copy one F32 or BF16 tensor out of the file, as f32. Each group is decoded with `from_le_bytes`:
     /// the data section has no alignment guarantee (it starts at 8 + N), so we can't
     /// reinterpret the bytes as `&[f32]` in place.
     pub fn tensor(&self, name: &str) -> Result<Tensor> {
@@ -153,21 +153,30 @@ impl SafeTensors {
             .entries
             .get(name)
             .ok_or_else(|| Error::Format(format!("tensor `{name}` not in file")))?;
-        if e.dtype != Dtype::F32 {
-            return Err(Error::Format(format!(
-                "tensor `{name}` is {:?}; only F32 is supported so far",
-                e.dtype
-            )));
-        }
         let bytes = &self.bytes.as_slice()[self.data_start + e.begin..self.data_start + e.end];
-        // `as_chunks` splits off whole [u8; 4] groups; the remainder is empty because the
-        // header check guaranteed end - begin == numel * 4.
-        let data = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect();
+        // `as_chunks` splits off whole groups; the remainder is empty because the header check
+        // guaranteed end - begin == numel * the dtype's size.
+        let data = match e.dtype {
+            Dtype::F32 => bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+            // bf16 is the top half of an f32 (same sign and exponent, 7 mantissa bits), so the
+            // widening is exact (D68).
+            Dtype::BF16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
+                .collect(),
+            other => {
+                return Err(Error::Format(format!(
+                    "tensor `{name}` is {other:?}; only F32 and BF16 are supported"
+                )));
+            }
+        };
         Tensor::new(&e.shape, data)
     }
 }
@@ -376,11 +385,28 @@ mod tests {
     }
 
     #[test]
-    fn other_dtypes_parse_but_dont_read_as_f32() {
-        let header = r#"{"h":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
-        let st = SafeTensors::from_bytes(file(header, &[0; 4])).unwrap();
-        assert_eq!(st.entry("h").unwrap().dtype, Dtype::BF16);
-        assert!(st.tensor("h").unwrap_err().to_string().contains("only F32"));
+    fn bf16_widens_exactly_and_other_dtypes_are_refused() {
+        // bf16 bit patterns: 1.0, -2.5, -0.0, the smallest subnormal, +inf, a quiet NaN. Each
+        // must become the f32 with the same top 16 bits and zeros below (D68).
+        let bf16: [u16; 6] = [0x3F80, 0xC020, 0x8000, 0x0001, 0x7F80, 0x7FC0];
+        let data: Vec<u8> = bf16.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let header = r#"{"w":{"dtype":"BF16","shape":[6],"data_offsets":[0,12]},
+                         "h":{"dtype":"F16","shape":[2],"data_offsets":[12,16]}}"#;
+        let mut bytes = data;
+        bytes.extend_from_slice(&[0; 4]);
+        let st = SafeTensors::from_bytes(file(header, &bytes)).unwrap();
+        let w = st.tensor("w").unwrap();
+        let bits: Vec<u32> = w.data().iter().map(|x| x.to_bits()).collect();
+        let want: Vec<u32> = bf16.iter().map(|&h| u32::from(h) << 16).collect();
+        assert_eq!(bits, want);
+        assert_eq!(&w.data()[..2], &[1.0, -2.5]);
+        assert_eq!(st.entry("h").unwrap().dtype, Dtype::F16);
+        assert!(
+            st.tensor("h")
+                .unwrap_err()
+                .to_string()
+                .contains("only F32 and BF16")
+        );
     }
 
     #[test]

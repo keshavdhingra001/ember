@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod error;
 pub mod gpt2;
 pub mod gpu;
+pub mod llama;
 pub mod ops;
 pub mod profile;
 pub mod rng;

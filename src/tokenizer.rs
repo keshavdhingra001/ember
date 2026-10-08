@@ -15,6 +15,10 @@
 //!
 //! Because the base alphabet is all 256 bytes, any string encodes: there is no unknown token.
 //! Decoding concatenates the tokens' bytes and reads them as UTF-8.
+//!
+//! Llama-family models of the same lineage (SmolLM2) add two steps, read from `tokenizer.json`
+//! by [`Tokenizer::load_hf`] (D75): special tokens such as `<|im_start|>` are cut out of the
+//! text whole before anything else, and every digit becomes its own piece before step 1.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -37,11 +41,17 @@ pub struct Tokenizer {
     tokens: Vec<Vec<u8>>,
     /// Token text (in the byte-stand-in alphabet) -> id, as in `vocab.json`.
     ids: HashMap<String, u32>,
-    /// Single byte -> its one-symbol token id. All 256 exist in GPT-2's vocab.
-    byte_ids: [u32; 256],
+    /// Single byte -> its one-symbol token id. All 256 exist in GPT-2's vocab; SmolLM2's lacks
+    /// 21 (rare controls and bytes valid UTF-8 almost never uses), and such a byte is dropped
+    /// from the input, as Hugging Face does without an unknown token (D75).
+    byte_ids: [Option<u32>; 256],
     /// `(left, right)` -> `(rank, merged)`: lower rank merges first.
     merges: HashMap<(u32, u32), (u32, u32)>,
     pattern: Regex,
+    /// Split every digit into its own piece before the regex (D75; off for GPT-2).
+    split_digits: bool,
+    /// Special tokens matched whole in the input, longest first (D75; none for GPT-2, D11).
+    special: Vec<(String, u32)>,
 }
 
 impl Tokenizer {
@@ -55,7 +65,17 @@ impl Tokenizer {
             .map_err(|e| Error::Format(format!("{}: {e}", dir.display())))
     }
 
+    /// A tokenizer from the two files' contents. Every byte must have its own token (GPT-2's
+    /// promise that any string encodes).
     pub fn from_strings(vocab_json: &str, merges_txt: &str) -> std::result::Result<Self, String> {
+        let tok = Self::parse(vocab_json, merges_txt)?;
+        if let Some(b) = (0..=255u8).find(|&b| tok.byte_ids[b as usize].is_none()) {
+            return Err(format!("vocab has no token for byte {b:#04x}"));
+        }
+        Ok(tok)
+    }
+
+    fn parse(vocab_json: &str, merges_txt: &str) -> std::result::Result<Self, String> {
         let char_to_byte: HashMap<char, u8> = (0..=255u8).map(|b| (byte_to_char(b), b)).collect();
 
         let vocab: Value =
@@ -88,11 +108,9 @@ impl Tokenizer {
         // Every slot is filled: n entries, ids all < n, no id used twice.
         let tokens: Vec<Vec<u8>> = tokens.into_iter().map(Option::unwrap).collect();
 
-        let mut byte_ids = [0; 256];
+        let mut byte_ids = [None; 256];
         for b in 0..=255u8 {
-            byte_ids[b as usize] = *ids
-                .get(&byte_to_char(b).to_string())
-                .ok_or_else(|| format!("vocab has no token for byte {b:#04x}"))?;
+            byte_ids[b as usize] = ids.get(&byte_to_char(b).to_string()).copied();
         }
 
         let mut merges = HashMap::new();
@@ -119,7 +137,84 @@ impl Tokenizer {
             byte_ids,
             merges,
             pattern: Regex::new(PATTERN).expect("PATTERN is a valid regex"),
+            split_digits: false,
+            special: Vec::new(),
         })
+    }
+
+    /// Load a byte-level BPE tokenizer with the extras its `tokenizer.json` asks for (D75):
+    /// the digit split and the special tokens. Only the shapes ember implements are accepted:
+    /// no normalizer, and a pre-tokenizer that is GPT-2's `ByteLevel` alone or preceded by
+    /// `Digits` with `individual_digits`. Anything else is an error, not a silent mismatch.
+    pub fn load_hf(dir: &Path) -> Result<Self> {
+        let read = |name: &str| {
+            let path = dir.join(name);
+            std::fs::read_to_string(&path).map_err(|e| Error::io(&path, e))
+        };
+        let in_dir = |e: String| Error::Format(format!("{}: {e}", dir.display()));
+        let mut tok = Self::parse(&read("vocab.json")?, &read("merges.txt")?).map_err(in_dir)?;
+        tok.apply_hf(&read("tokenizer.json")?)
+            .map_err(|e| in_dir(format!("tokenizer.json: {e}")))?;
+        Ok(tok)
+    }
+
+    fn apply_hf(&mut self, tokenizer_json: &str) -> std::result::Result<(), String> {
+        let t: Value = serde_json::from_str(tokenizer_json).map_err(|e| e.to_string())?;
+        if !t["normalizer"].is_null() {
+            return Err(format!("unsupported normalizer {}", t["normalizer"]));
+        }
+        let byte_level = |p: &Value| {
+            p["type"] == "ByteLevel" && p["add_prefix_space"] == false && p["use_regex"] != false
+        };
+        let pre = &t["pre_tokenizer"];
+        self.split_digits = if byte_level(pre) {
+            false
+        } else if pre["type"] == "Sequence"
+            && pre["pretokenizers"].as_array().is_some_and(|ps| {
+                ps.len() == 2
+                    && ps[0]["type"] == "Digits"
+                    && ps[0]["individual_digits"] == true
+                    && byte_level(&ps[1])
+            })
+        {
+            true
+        } else {
+            return Err(format!("unsupported pre-tokenizer {pre}"));
+        };
+        // Plain BPE as `bpe` implements it. GPT-2's older file has no "type".
+        let model = &t["model"];
+        let empty = |v: &Value| v.is_null() || *v == "";
+        if !(model["type"] == "BPE" || model["type"].is_null())
+            || !model["unk_token"].is_null()
+            || model["byte_fallback"] == true
+            || model["ignore_merges"] == true
+            || !empty(&model["continuing_subword_prefix"])
+            || !empty(&model["end_of_word_suffix"])
+        {
+            return Err("model is not plain byte-level BPE".into());
+        }
+        let mut special = Vec::new();
+        for a in t["added_tokens"].as_array().into_iter().flatten() {
+            let (Some(text), Some(id)) = (a["content"].as_str(), a["id"].as_u64()) else {
+                return Err(format!("bad added token {a}"));
+            };
+            // `normalized` only matters with a normalizer, and there is none (checked above).
+            if a["special"] != true
+                || a["lstrip"] == true
+                || a["rstrip"] == true
+                || a["single_word"] == true
+            {
+                return Err(format!("unsupported added token {a}"));
+            }
+            if self.token_id(text) != Some(id as u32) {
+                return Err(format!("added token `{text}` is not id {id} in vocab.json"));
+            }
+            special.push((text.to_string(), id as u32));
+        }
+        // Longest first, so a special token that is a prefix of another can't shadow it.
+        special.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+        self.special = special;
+        Ok(())
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -131,28 +226,80 @@ impl Tokenizer {
         self.ids.get(text).copied()
     }
 
-    /// Encode text as plain text: `<|endoftext|>` written in the input becomes ordinary tokens,
-    /// as in OpenAI's original encoder (Hugging Face maps it to the special id instead).
+    /// Encode text. With [`Tokenizer::load`] (GPT-2) this is plain text: `<|endoftext|>`
+    /// written in the input becomes ordinary tokens, as in OpenAI's original encoder (D11).
+    /// With [`Tokenizer::load_hf`], special tokens in the input map to their ids, as Hugging
+    /// Face does (D75).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut out = Vec::new();
-        for word in self.split(text)? {
-            out.extend(self.bpe(word.as_bytes()));
+        let mut rest = text;
+        while !rest.is_empty() {
+            // The earliest special token in `rest`; at one position, the longest.
+            let next = self
+                .special
+                .iter()
+                .filter_map(|(s, id)| rest.find(s.as_str()).map(|at| (at, s.len(), *id)))
+                .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            let (plain, special) = match next {
+                Some((at, len, id)) => (&rest[..at], Some((id, at + len))),
+                None => (rest, None),
+            };
+            for word in self.split(plain)? {
+                out.extend(self.bpe(word.as_bytes()));
+            }
+            match special {
+                Some((id, end)) => {
+                    out.push(id);
+                    rest = &rest[end..];
+                }
+                None => break,
+            }
         }
         Ok(out)
     }
 
-    /// Step 1: the regex pre-split. Public so `ember tokenize` can show it.
+    /// Step 1: the pre-split (each digit on its own first, if the tokenizer asks for it, then
+    /// GPT-2's regex within each piece). Public so `ember tokenize` can show it.
     pub fn split<'t>(&self, text: &'t str) -> Result<Vec<&'t str>> {
-        self.pattern
-            .find_iter(text)
-            .map(|m| m.map(|m| m.as_str()))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| Error::Input(format!("pre-tokenizer regex failed: {e}")))
+        let mut words = Vec::new();
+        for piece in self.digit_pieces(text) {
+            for m in self.pattern.find_iter(piece) {
+                let m = m.map_err(|e| Error::Input(format!("pre-tokenizer regex failed: {e}")))?;
+                words.push(m.as_str());
+            }
+        }
+        Ok(words)
     }
 
-    /// Steps 2 and 3 for one pre-split word.
+    /// `text` cut so that every numeric character (`char::is_numeric`, as Hugging Face's
+    /// `Digits` uses) stands alone; the whole text when the digit split is off.
+    fn digit_pieces<'t>(&self, text: &'t str) -> Vec<&'t str> {
+        if !self.split_digits {
+            return vec![text];
+        }
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        for (i, c) in text.char_indices() {
+            if c.is_numeric() {
+                if start < i {
+                    pieces.push(&text[start..i]);
+                }
+                pieces.push(&text[i..i + c.len_utf8()]);
+                start = i + c.len_utf8();
+            }
+        }
+        if start < text.len() {
+            pieces.push(&text[start..]);
+        }
+        pieces
+    }
+
+    /// Steps 2 and 3 for one pre-split word. Bytes without a token are dropped before merging.
     fn bpe(&self, word: &[u8]) -> Vec<u32> {
-        let mut symbols: Vec<u32> = word.iter().map(|&b| self.byte_ids[b as usize]).collect();
+        let mut symbols: Vec<u32> = word
+            .iter()
+            .filter_map(|&b| self.byte_ids[b as usize])
+            .collect();
         loop {
             // The adjacent pair that was learned earliest. Ties can't happen: ranks are unique.
             let best = symbols
@@ -306,6 +453,111 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(t.decode(&ids[..1]).unwrap(), "\u{FFFD}");
         assert!(t.decode(&[100_000]).is_err());
+    }
+
+    /// `toy()` with SmolLM2's extras: a digit split and the special tokens `<s>` (id 260) and
+    /// `<s>x` (261), one a prefix of the other.
+    fn toy_hf() -> Tokenizer {
+        let mut vocab: serde_json::Map<String, Value> = (0..=255u8)
+            .map(|b| (byte_to_char(b).to_string(), b.into()))
+            .collect();
+        for (i, t) in ["ab", "abc", "Ġab", "aa", "<s>", "<s>x"].iter().enumerate() {
+            vocab.insert(t.to_string(), (256 + i).into());
+        }
+        let mut t =
+            Tokenizer::parse(&Value::Object(vocab).to_string(), "a b\nab c\nĠ ab\na a\n").unwrap();
+        t.apply_hf(&hf_json(
+            r#"{"type": "Sequence", "pretokenizers": [
+                {"type": "Digits", "individual_digits": true},
+                {"type": "ByteLevel", "add_prefix_space": false, "use_regex": true}]}"#,
+        ))
+        .unwrap();
+        t
+    }
+
+    fn hf_json(pre_tokenizer: &str) -> String {
+        format!(
+            r#"{{"normalizer": null, "pre_tokenizer": {pre_tokenizer},
+                "model": {{"type": "BPE", "unk_token": null}},
+                "added_tokens": [
+                  {{"id": 260, "content": "<s>", "special": true}},
+                  {{"id": 261, "content": "<s>x", "special": true}}]}}"#
+        )
+    }
+
+    #[test]
+    fn digits_stand_alone_before_the_regex() {
+        let t = toy_hf();
+        let cases: [(&str, &[&str]); 4] = [
+            ("x=42!", &["x", "=", "4", "2", "!"]),
+            (" 42 ", &[" ", "4", "2", " "]), // the space can't lead a digit any more
+            ("ab12cd", &["ab", "1", "2", "cd"]),
+            ("٣²", &["٣", "²"]), // char::is_numeric: other scripts and superscripts too
+        ];
+        for (text, want) in cases {
+            assert_eq!(t.split(text).unwrap(), want, "{text:?}");
+        }
+        assert_eq!(toy().split("x=42!").unwrap(), ["x", "=", "42", "!"]); // GPT-2: off
+    }
+
+    #[test]
+    fn special_tokens_match_whole_earliest_then_longest() {
+        let t = toy_hf();
+        assert_eq!(t.encode("<s>").unwrap(), [260]);
+        assert_eq!(t.encode("<s>x").unwrap(), [261]); // not <s> then x
+        assert_eq!(t.encode("ab<s>ab").unwrap(), [256, 260, 256]);
+        assert_eq!(t.encode("<s><s>x").unwrap(), [260, 261]);
+        // A near miss is plain text, byte by byte here.
+        assert_eq!(t.encode("<s").unwrap(), [u32::from(b'<'), u32::from(b's')]);
+        // Without load_hf there are no special tokens (D11).
+        assert_ne!(toy().encode("<s>").unwrap(), [260]);
+    }
+
+    #[test]
+    fn bytes_without_a_token_are_dropped_before_merging() {
+        // A vocab without byte 0x04 (ids stay dense: "!?" takes id 4). "!\x04?" is one symbol
+        // run for the regex; dropping 0x04 leaves "!?", which then merges.
+        let mut vocab: serde_json::Map<String, Value> = (0..=255u8)
+            .filter(|&b| b != 4)
+            .map(|b| (byte_to_char(b).to_string(), b.into()))
+            .collect();
+        vocab.insert("!?".into(), 4.into());
+        let vocab = Value::Object(vocab).to_string();
+        let e = Tokenizer::from_strings(&vocab, "! ?\n").err().unwrap();
+        assert!(e.contains("no token for byte 0x04"), "{e}"); // GPT-2's loader insists
+        let t = Tokenizer::parse(&vocab, "! ?\n").unwrap();
+        assert_eq!(t.encode("!\x04?").unwrap(), [4]);
+        assert_eq!(t.encode("\x04").unwrap(), [0u32; 0]);
+        // Across words nothing merges: "a", "\x04" and "b" are three regex matches.
+        assert_eq!(
+            t.encode("a\x04b").unwrap(),
+            [u32::from(b'a'), u32::from(b'b')]
+        );
+    }
+
+    #[test]
+    fn rejects_tokenizer_json_it_cannot_follow() {
+        let byte_level = r#"{"type": "ByteLevel", "add_prefix_space": false}"#;
+        let bad = [
+            hf_json(byte_level)
+                .replace(r#""normalizer": null"#, r#""normalizer": {"type": "NFC"}"#),
+            hf_json(r#"{"type": "ByteLevel", "add_prefix_space": true}"#),
+            hf_json(r#"{"type": "Whitespace"}"#),
+            hf_json(&format!(
+                r#"{{"type": "Sequence", "pretokenizers": [
+                    {{"type": "Digits", "individual_digits": false}}, {byte_level}]}}"#
+            )),
+            hf_json(byte_level).replace(r#""unk_token": null"#, r#""unk_token": "<unk>""#),
+            hf_json(byte_level).replace(r#""type": "BPE""#, r#""type": "WordPiece""#),
+            hf_json(byte_level).replace(r#""id": 260"#, r#""id": 7"#), // not its vocab id
+            hf_json(byte_level).replace(r#""special": true}]"#, r#""special": false}]"#),
+        ];
+        for json in bad {
+            assert_ne!(json, hf_json(byte_level), "the case must change the file");
+            let mut t = toy_hf();
+            assert!(t.apply_hf(&json).is_err(), "accepted {json}");
+        }
+        assert!(toy_hf().apply_hf(&hf_json(byte_level)).is_ok());
     }
 
     #[test]

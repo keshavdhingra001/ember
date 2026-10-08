@@ -1009,3 +1009,72 @@ position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
   - Short prefills got slower in attention (0.30 → 0.49 ms over 12 layers; 0.82 before the
     staging fix): a 7-token row still runs a 64-thread workgroup per chunk and a second pass.
     0.2 ms of a 31 ms prefill.
+
+## M8: A Llama-family model (approved 2026-10-08)
+
+SmolLM2-135M (Hugging Face `HuggingFaceTB/SmolLM2-135M`, revision `93efa2f`): Llama
+architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64, SwiGLU MLP of
+1536, vocabulary 49152, RoPE θ = 100000, RMSNorm ε = 1e-5, tied embeddings, bf16 weights.
+
+### D67: SmolLM2-135M first, 360M as a scale check, Qwen2.5 deferred
+- **What:** build for SmolLM2-135M; then run SmolLM2-360M (E = 960, 32 layers, 15/5 heads) by
+  config alone, with no code change.
+- **Alternatives:** Qwen2.5-0.5B: a 151936-token vocabulary (545 MB for the embedding alone in
+  f32, ~2 GB in all), biases on q/k/v, and a different pre-tokenizer pattern.
+- **Why:** 135M is GPT-2's size class, so the numbers compare directly, and it is the plain
+  Llama layout. Qwen fits better after M9 makes weights smaller.
+
+### D68: bf16 weights become f32 on load
+- **What:** the loader converts bf16 to f32 (exact: the bf16 bits are the top half of the f32).
+  Kernels stay f32.
+- **Alternatives:** bf16 on the GPU, unpacked in the matmul (half the bytes per token: that is
+  M9's job).
+
+### D69: The oracle chain for Llama
+- **What:** a plain-Rust f32 CPU reference (`src/llama/`), checked against a numpy float64
+  implementation (`scripts/llama_golden.py`, same approach as D12), and token ids checked
+  against the `tokenizers` library. No PyTorch (PyPI is too slow on this network).
+- **Alternatives:** transformers + torch goldens; llama.cpp's output (comes with M11).
+
+### D70: RoPE pairs dimension i with i + d/2, from one shared table
+- **What:** Hugging Face's Llama layout ("rotate half"): for i < d/2,
+  `x'[i] = x[i] cos - x[i + d/2] sin`, `x'[i + d/2] = x[i + d/2] cos + x[i] sin`, angle
+  `pos * θ^(-2i/d)`. A `[n_ctx, d/2]` cos table and sin table are computed once on the CPU in
+  f64, rounded to f32, and used by both the CPU reference and the GPU kernel. Q and K are
+  rotated before K goes into the cache.
+- **Alternatives:** sin/cos inside the shader (WGSL's sin and cos have loose accuracy
+  guarantees, worse for large arguments, and differ from the CPU's); interleaved pairs (GPT-J
+  layout: wrong for these weights).
+
+### D71: Grouped-query attention in the existing kernel
+- **What:** query head h reads key/value head `h / (n_head / n_kv_head)`. The cache holds only
+  the key/value heads: `[n_ctx, n_kv_head * d]`. GPT-2 is the case `n_kv_head = n_head`, and
+  its outputs must stay bit-for-bit the same (tested).
+- **Alternatives:** a second attention kernel; expanding K and V to all heads (3× the cache and
+  the reads).
+
+### D72: Fused projection matrices
+- **What:** at load, q, k and v become one `[E, (n_head + 2 n_kv_head) d]` matrix and gate
+  and up one `[E, 2 I]` matrix, so each is one matmul, as GPT-2's `c_attn`.
+
+### D73: RMSNorm and SiLU-multiply kernels
+- **What:** `rms_norm.wgsl` (the fixed reduction tree of `reduce.wgsl`, sum of squares, gain,
+  no bias) and `silu_mul.wgsl` (`silu(gate) * up` over the fused `[T, 2I]` buffer). The down
+  projection adds the residual in its epilogue (D62).
+- **Alternatives:** SwiGLU as a matmul epilogue (each thread would need its gate and up
+  columns together); deferred until a profile says it matters.
+
+### D74: `src/llama/` beside `src/gpt2/`, shared ops and cache
+- **What:** config, weights, CPU forward and GPU forward per model; the KV cache and workspace
+  take their sizes from the model; the CLI gets `--model gpt2 | smollm2-135m`.
+- **Alternatives:** one generic model abstraction over both (more indirection than two models
+  justify).
+
+### D75: The tokenizer learns digits and special tokens
+- **What:** SmolLM2 uses GPT-2's byte-level BPE with two additions: digits are split one by
+  one before the byte-level step, and added tokens (`<|endoftext|>`, `<|im_start|>`, …) are
+  matched whole before BPE. Both are read from `tokenizer.json`; GPT-2's ids don't change.
+
+### D76: The KV cache is sized for 2048 positions by default
+- **What:** `n_ctx` for the cache and workspace defaults to 2048 (configurable), below the
+  model's 8192: at 8192 the cache alone would be 30 × 2 × 8192 × 192 × 4 B = 377 MB.

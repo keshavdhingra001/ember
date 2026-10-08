@@ -31,6 +31,21 @@ pub fn gpt2_dir() -> Option<PathBuf> {
     }
 }
 
+/// `data/smollm2-135m/` if SmolLM2-135M has been fetched; otherwise prints how and returns
+/// `None` (D15).
+pub fn smollm2_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/smollm2-135m");
+    if dir.join("model.safetensors").exists() {
+        Some(dir)
+    } else {
+        eprintln!(
+            "SKIPPED: SmolLM2-135M not found in data/smollm2-135m/. \
+             Fetch it with scripts/fetch_smollm2.sh"
+        );
+        None
+    }
+}
+
 /// `data/gpt2/golden/` if the reference outputs have been generated (needs the weights too).
 pub fn gpt2_golden_dir() -> Option<PathBuf> {
     let dir = gpt2_dir()?.join("golden");
