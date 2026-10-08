@@ -73,9 +73,11 @@ impl Config {
         let c = Config {
             n_layer: int("num_hidden_layers")?,
             n_head: int("num_attention_heads")?,
-            n_kv_head: v
-                .get("num_key_value_heads")
-                .map_or(int("num_attention_heads"), |_| int("num_key_value_heads"))?,
+            // Absent or null (Hugging Face's default): one key/value head per query head.
+            n_kv_head: match v.get("num_key_value_heads") {
+                None | Some(Value::Null) => int("num_attention_heads")?,
+                Some(_) => int("num_key_value_heads")?,
+            },
             n_embd: int("hidden_size")?,
             n_ff: int("intermediate_size")?,
             vocab_size: int("vocab_size")?,
@@ -156,6 +158,12 @@ mod tests {
         // Without num_key_value_heads every head has its own K and V (plain multi-head).
         let mha = Config::from_json(&SMOL.replace("\"num_key_value_heads\": 3,", "")).unwrap();
         assert_eq!(mha.n_kv_head, 9);
+        let null = Config::from_json(&SMOL.replace(
+            "\"num_key_value_heads\": 3",
+            "\"num_key_value_heads\": null",
+        ))
+        .unwrap();
+        assert_eq!(null.n_kv_head, 9);
     }
 
     #[test]
