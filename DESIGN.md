@@ -1035,6 +1035,17 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
   implementation (`scripts/llama_golden.py`, same approach as D12), and token ids checked
   against the `tokenizers` library. No PyTorch (PyPI is too slow on this network).
 - **Alternatives:** transformers + torch goldens; llama.cpp's output (comes with M11).
+- **Built (§2):** `scripts/llama_golden.py` (numpy float64, vectorized; RoPE angles in f64)
+  writes a committed tiny model (`tests/fixtures/tiny_llama`: 2 layers, 6 query heads over 2
+  key/value heads, d = 4, bf16 weights; the seed search requires a varied greedy continuation,
+  since a random model with tied embeddings keeps predicting its last token) and goldens for
+  SmolLM2-135M. The numpy model continues "I enjoy walking with my cute dog" with ", and I
+  love to watch him play.": fluent text, which a wrong RoPE pairing or head grouping would
+  not give. The Rust CPU reference matches the tiny model at 1.3e-6 and SmolLM2's greedy
+  continuations exactly (4 prompts, 52 tokens; closest top-2 gap 0.024).
+- **Tolerance:** SmolLM2's logits differ from float64 by up to 4.8e-4 (GPT-2: 6.4e-4 on logits
+  5x larger). An independent float32 numpy forward is off by the same amount (up to 3.9e-4),
+  so it is f32 rounding over 30 layers. The test allows 2e-3 absolute (4x).
 
 ### D70: RoPE pairs dimension i with i + d/2, from one shared table
 - **What:** Hugging Face's Llama layout ("rotate half"): for i < d/2,
@@ -1074,6 +1085,15 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
 - **What:** SmolLM2 uses GPT-2's byte-level BPE with two additions: digits are split one by
   one before the byte-level step, and added tokens (`<|endoftext|>`, `<|im_start|>`, …) are
   matched whole before BPE. Both are read from `tokenizer.json`; GPT-2's ids don't change.
+- **Built (§1):** `Tokenizer::load_hf` reads `tokenizer.json` and refuses every setting it
+  doesn't implement (a normalizer, `add_prefix_space`, an unknown token, byte fallback,
+  `ignore_merges`, subword prefixes, non-special or stripping added tokens). Found on the
+  way: SmolLM2's vocabulary has no token for 21 bytes (six control characters and bytes valid
+  UTF-8 almost never uses: 0xC0, 0xC1, 0xF1, 0xF2, 0xF5–0xFF). Hugging Face, with no unknown
+  token, drops such a byte before merging, so ember does too; `load` (GPT-2) still requires
+  all 256. Special tokens: earliest match first, the longest at one position. Matches
+  `tokenizers` 0.23.2 on 31 strings (GPT-2's 23 plus digits, non-ASCII digits and special
+  tokens next to text).
 
 ### D76: The KV cache is sized for 2048 positions by default
 - **What:** `n_ctx` for the cache and workspace defaults to 2048 (configurable), below the

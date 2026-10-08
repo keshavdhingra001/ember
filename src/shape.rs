@@ -67,6 +67,66 @@ pub(crate) fn qkv(op: &str, qkv: &[usize], n_head: usize) -> Result<(usize, usiz
     Ok((t, three_e / 3))
 }
 
+/// `qkv: [T, (H + 2 KV) d]` for H query heads sharing KV key/value heads (D71). Returns
+/// `(T, d)`.
+pub(crate) fn qkv_gqa(
+    op: &str,
+    qkv: &[usize],
+    n_head: usize,
+    n_kv_head: usize,
+) -> Result<(usize, usize)> {
+    let &[t, width] = qkv else {
+        return Err(Error::Shape(format!("{op}: qkv {qkv:?} must be 2-D")));
+    };
+    if n_head == 0 || n_kv_head == 0 || !n_head.is_multiple_of(n_kv_head) {
+        return Err(Error::Shape(format!(
+            "{op}: {n_head} query heads don't group over {n_kv_head} key/value heads"
+        )));
+    }
+    let heads = n_head + 2 * n_kv_head;
+    if !width.is_multiple_of(heads) {
+        return Err(Error::Shape(format!(
+            "{op}: qkv {qkv:?} doesn't split into {n_head} + 2 x {n_kv_head} heads"
+        )));
+    }
+    Ok((t, width / heads))
+}
+
+/// `x: [T, E]` and `gain: [E]`. Returns `(T, E)`.
+pub(crate) fn rms_norm(x: &[usize], gain: &[usize]) -> Result<(usize, usize)> {
+    match (x, gain) {
+        (&[t, e], &[g]) if g == e => Ok((t, e)),
+        _ => Err(Error::Shape(format!("rms_norm: x {x:?}, gain {gain:?}"))),
+    }
+}
+
+/// `x: [T, W]` whose first `n_rot` heads of width d (even) are rotated at positions
+/// `start..start + T`, with tables `[n_pos, d/2]` covering them. Returns `(T, W)`.
+pub(crate) fn rope(
+    x: &[usize],
+    n_rot: usize,
+    d: usize,
+    start: usize,
+    cos: &[usize],
+    sin: &[usize],
+) -> Result<(usize, usize)> {
+    let &[t, w] = x else {
+        return Err(Error::Shape(format!("rope: x {x:?} must be 2-D")));
+    };
+    if d == 0 || !d.is_multiple_of(2) || n_rot * d > w {
+        return Err(Error::Shape(format!(
+            "rope: {n_rot} heads of width {d} (must be even) in rows of {w}"
+        )));
+    }
+    match (cos, sin) {
+        (&[n, h], s) if h == d / 2 && s == cos && start + t <= n => Ok((t, w)),
+        _ => Err(Error::Shape(format!(
+            "rope: tables {cos:?} / {sin:?} for d = {d} and positions {start}..{}",
+            start + t
+        ))),
+    }
+}
+
 /// `wte: [V, E]`, `wpe: [n_ctx, E]`, and `ids` at positions `start..`: every id inside the
 /// vocab, every position inside the context. Returns `E`. A kernel can't report a bad id, only
 /// read the wrong row (D9), so this runs before every embed.

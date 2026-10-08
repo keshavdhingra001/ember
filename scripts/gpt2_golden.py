@@ -101,11 +101,15 @@ def forward(W, cfg, ids):
 
 
 def greedy(W, cfg, ids, n):
+    return greedy_from(lambda ids: forward(W, cfg, ids)[-1], ids, n)
+
+
+def greedy_from(last_logits, ids, n):
     """n greedy tokens (full recompute each step). Also returns the smallest gap between the
     best and second-best logit over the steps: if it is tiny, float32 could pick differently."""
     ids, min_gap = list(ids), np.inf
     for _ in range(n):
-        last = forward(W, cfg, ids)[-1]
+        last = last_logits(ids)
         top2 = np.sort(last)[-2:]
         min_gap = min(min_gap, top2[1] - top2[0])
         ids.append(int(np.argmax(last)))  # argmax returns the first index on ties

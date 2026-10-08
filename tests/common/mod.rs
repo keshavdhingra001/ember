@@ -60,6 +60,26 @@ pub fn gpt2_golden_dir() -> Option<PathBuf> {
     }
 }
 
+/// `data/smollm2-135m/golden/` if the reference outputs have been generated.
+pub fn smollm2_golden_dir() -> Option<PathBuf> {
+    let dir = smollm2_dir()?.join("golden");
+    if dir.join("manifest.json").exists() {
+        Some(dir)
+    } else {
+        eprintln!(
+            "SKIPPED: SmolLM2 golden outputs not found. Generate them with \
+             `python scripts/llama_golden.py smollm2` (see the script's header for the venv)"
+        );
+        None
+    }
+}
+
+/// The committed 2-layer Llama-family model (bf16 weights, 6 query heads over 2 key/value
+/// heads) and its numpy goldens.
+pub fn tiny_llama_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_llama")
+}
+
 /// The committed 2-layer model, its tokenizer files and its numpy goldens.
 pub fn tiny_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_gpt2")

@@ -2,5 +2,9 @@
 //! the same forward pass on the GPU.
 
 mod config;
+mod forward;
+mod weights;
 
 pub use config::Config;
+pub use forward::{forward, generate_greedy, hidden, next_logits};
+pub use weights::{Block, Weights};
