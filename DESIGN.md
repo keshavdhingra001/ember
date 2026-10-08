@@ -924,6 +924,24 @@ position 8 ~21 ms (~47 tokens/s), attention at position 1000 ~3–4 ms.
   uncached path, which recomputes short sequences, slowed down. Now only the halves that hold
   keys are staged, one key row per step (thread l loads dim l, d <= 64 = WG). Same arithmetic,
   same bits.
+- **The no-cache "regression" was the benchmark (§4, approved 2026-10-08):** `ember bench`'s
+  uncached rate went 64 → 84 ms/token from §3 on, but the uncached path's kernel time did not
+  change (51–56 ms per call at T = 7..40, s2 and HEAD alike), and `generate --no-cache` was not
+  slower. `bench` kept its `KvCache` (KV rows + workspace, 155 MiB, 52 MB more than before
+  because of `Role::Parts`) alive while timing the uncached loop. wgpu 30 sub-allocates with
+  gpu-allocator in 128–256 MiB blocks and frees a spare block as soon as it empties. With the
+  cache allocated, one uncached call's temporaries stop fitting the existing blocks at T = 20:
+  each call then creates and frees a 256 MiB block (allocator report polled during the calls:
+  5 blocks at T = 19, a 6th at T = 20; 68 → 101 ms per call), about +60 ms per call over a
+  T = 7..40 sweep. Fix: `bench` drops the cache before the uncached run, so it measures the M3
+  path as `generate --no-cache` runs it. Paired runs after the fix (alternating, on battery, so
+  slower than the §4 table): s2 66.7 / 67.5 / 68.0 vs HEAD 70.5 / 71.7 / 72.1 ms/token. The
+  remaining +4 ms (6%) is partly attention on short prefills: at T = 40, 12 layers of attention
+  + combine take 3.6–3.7 ms vs 1.9–2.7 ms for the old one-pass kernel (timestamp queries, 2
+  paired runs), so +1–1.8 ms; the rest is within the run-to-run spread of the kernel totals
+  (57–63 ms) and not explained further. Not fixed: the
+  uncached path is the M3 reference, not a serving path. A long-running engine that allocates
+  per call would hit the same block churn; the cached path allocates nothing per token (D60).
 
 ### D64: M7 tests
 - **What:** outputs into oversized buffers pre-filled with sentinels (D9): the elements past the

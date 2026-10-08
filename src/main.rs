@@ -283,6 +283,10 @@ fn bench(args: &[String]) -> CliResult {
     let runs = (0..RUNS).map(|_| cached()).collect::<Result<Vec<_>, _>>()?;
     let prefill = median(runs.iter().map(|r| r.0).collect());
     let decode = median(runs.iter().map(|r| r.1).collect());
+    // The uncached path runs without a cache, as `generate --no-cache` does. With the cache's
+    // 155 MiB still allocated, its temporaries stop fitting the allocator's blocks from T = 20
+    // on, and each step then creates and frees a 256 MiB block: +60 ms per token (D63).
+    drop(cache);
 
     let uncached = || -> CliResult<f64> {
         let t = Instant::now();
