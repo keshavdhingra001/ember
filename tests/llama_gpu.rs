@@ -161,3 +161,32 @@ fn smollm2_cached_decode_is_bitwise_full_recompute() {
         new = vec![next];
     }
 }
+
+#[test]
+fn smollm2_360m_runs_by_config_alone() {
+    // D67's scale check: E = 960, 32 layers, 15 query heads over 5 key/value heads, with no
+    // code of its own. Fetch with `scripts/fetch_smollm2.sh 360m`. GPU vs CPU only (no numpy
+    // goldens): logits within the 135M bound, greedy tokens identical.
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/smollm2-360m");
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("SKIPPED: SmolLM2-360M not found. Fetch it with scripts/fetch_smollm2.sh 360m");
+        return;
+    }
+    let g = gpu();
+    let w = Weights::load(&dir).unwrap();
+    assert_eq!(
+        (w.config.n_embd, w.config.n_head, w.config.n_kv_head),
+        (960, 15, 5)
+    );
+    let gw = GpuWeights::upload(g, &w).unwrap();
+    let tok = ember::Tokenizer::load_hf(&dir).unwrap();
+    let ids = tok.encode("I enjoy walking with my cute dog").unwrap();
+    let want = llama::forward(&w, &ids).unwrap();
+    let got = g.read(&llama_gpu::forward(g, &gw, &ids).unwrap()).unwrap();
+    let stats = check(got.data(), want.data(), SMOL_TOL).unwrap();
+    eprintln!("360M GPU vs CPU: {stats:?}");
+    let cpu = llama::generate_greedy(&w, &ids, 8, |_| {}).unwrap();
+    let gpu = llama_gpu::generate_greedy(g, &gw, &ids, 8, |_| {}).unwrap();
+    assert_eq!(gpu, cpu);
+    eprintln!("360M continues: {:?}", tok.decode(&gpu).unwrap());
+}
