@@ -494,6 +494,32 @@ fn attention_uses_the_true_max_across_chunks() {
 }
 
 #[test]
+fn attention_with_every_score_far_below_zero() {
+    // Head 0: q = 8, k = -8 on its 8 dims scores exactly -512 / sqrt(8) = -181 for every key,
+    // so the right output is the mean of the values (the CPU subtracts the max). A thread that
+    // scores a key slot nobody staged (a row of shared memory past a short half, still zero)
+    // puts 0 into the chunk's max; every real exp(s - m) then underflows, the chunk's sum is 0
+    // and the output NaN. T = 100 gives rows with 1..32 keys in chunk 0 and short first halves
+    // in chunk 1. The scores are equal on purpose: random ones near -181 round by ~4e-6 (one
+    // f32 ulp there is 1.5e-5), which the output inherits and ATTENTION_TOL doesn't allow.
+    let g = gpu();
+    let (t, h, e) = (100, 2, 16);
+    let mut qkv = random(&[t, 3 * e], -1.0, 1.0, 43).data().to_vec();
+    for i in 0..t {
+        qkv[i * 3 * e..][..8].fill(8.0); // head 0 of Q
+        qkv[i * 3 * e + e..][..8].fill(-8.0); // head 0 of K
+    }
+    let qkv = Tensor::new(&[t, 3 * e], qkv).unwrap();
+    let gq = g.upload(&qkv);
+    compare(
+        "attention scores far below zero",
+        &cpu::causal_attention(&qkv, h).unwrap(),
+        ATTENTION_TOL,
+        || g.read(&ops::causal_attention(g, &gq, h).unwrap()).unwrap(),
+    );
+}
+
+#[test]
 fn attention_at_chunk_boundaries_and_past_1024() {
     // D64: T at the chunk edges (63, 64, 65 keys for the last row; 16 vs 17 chunks at
     // 1024/1025) and past the old 1024-position limit of D20. Every row i of a prefill sees
