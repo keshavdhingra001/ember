@@ -1,5 +1,6 @@
 //! ember: an LLM inference engine on WebGPU (wgpu + WGSL). See DESIGN.md.
 
+pub mod cache;
 pub mod compare;
 pub mod cpu;
 pub mod error;

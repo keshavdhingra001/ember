@@ -202,6 +202,57 @@ pub fn embed_into(
     )
 }
 
+/// `out[t] = wte[ids[t]]`: the token embedding alone (Llama takes positions through RoPE, D70).
+/// `wte_t: [E, V]` as for `embed`.
+pub fn gather(gpu: &Gpu, wte_t: &GpuTensor, ids: &[u32]) -> Result<GpuTensor> {
+    let ids_buf = gpu.upload_u32(ids);
+    once(gpu, &[ids.len(), wte_t.shape()[0]], |rec, out| {
+        gather_into(rec, wte_t, ids, &ids_buf, out)
+    })
+}
+
+/// `gather` into `out` (D61), with the ids already in `ids_buf`.
+pub fn gather_into(
+    rec: &mut Rec,
+    wte_t: &GpuTensor,
+    ids: &[u32],
+    ids_buf: &wgpu::Buffer,
+    out: &GpuTensor,
+) -> Result<()> {
+    let &[e, v] = wte_t.shape() else {
+        return Err(Error::Shape(format!(
+            "gather: table {:?} must be 2-D",
+            wte_t.shape()
+        )));
+    };
+    if let Some(&bad) = ids.iter().find(|&&id| id as usize >= v) {
+        return Err(Error::Input(format!(
+            "gather: token id {bad} is outside the vocab of {v}"
+        )));
+    }
+    check_out("gather", out, &[ids.len(), e])?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if (ids_buf.size() as usize) < ids.len() * 4 {
+        return Err(Error::Shape(format!(
+            "gather: id buffer of {} bytes for {} ids",
+            ids_buf.size(),
+            ids.len()
+        )));
+    }
+    let n = len_u32(ids.len() * e)?;
+    // No position table: the kernel never reads binding 1, which gets the token table.
+    let kernel = &rec.gpu.kernels.gather;
+    elementwise(
+        rec,
+        kernel,
+        &[&wte_t.buffer, &wte_t.buffer, ids_buf, &out.buffer],
+        Params4::new(n, e as u32, 0, len_u32(v)?),
+        rec.gpu.max_groups(),
+    )
+}
+
 /// `(E, V)` after checking the tables, the ids and the positions.
 fn embed_dims(
     wte_t: &GpuTensor,

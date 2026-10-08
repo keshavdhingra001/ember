@@ -5,6 +5,8 @@
 // the LM head's 38.6M.
 // One invocation per output element, grid-stride (D8). The host has already checked every id
 // is < V and start + T <= n_ctx: a shader can't report an error, only produce wrong numbers.
+// With POSITIONS = 0 (Llama: positions come from RoPE, D70) it is the gather alone, and the
+// host binds wte_t in wpe's place.
 
 struct Params {
     n: u32,     // T * E
@@ -20,6 +22,7 @@ struct Params {
 @group(0) @binding(4) var<uniform> params: Params;
 
 const WG: u32 = 256u;
+override POSITIONS: u32 = 1u;
 
 @compute @workgroup_size(WG)
 fn main(
@@ -30,6 +33,11 @@ fn main(
     for (var i = gid.x; i < params.n; i += stride) {
         let t = i / params.e;
         let c = i % params.e;
-        out[i] = wte_t[c * params.v + ids[t]] + wpe[params.start * params.e + i];  // row start + t, column c
+        let tok = wte_t[c * params.v + ids[t]];
+        if (POSITIONS == 1u) {
+            out[i] = tok + wpe[params.start * params.e + i];  // row start + t, column c
+        } else {
+            out[i] = tok;
+        }
     }
 }

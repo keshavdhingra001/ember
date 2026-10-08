@@ -6,11 +6,12 @@
 //! Two ways to run it: `forward` / `next_logits` recompute the whole sequence (M3, the
 //! comparison partner for D33), and `extend` runs only new tokens against a `KvCache` (M4).
 
+use crate::cache::{Bufs, CacheLayout, CacheModel};
 use crate::cpu;
 use crate::error::{Error, Result};
 use crate::gpt2::forward::greedy;
 use crate::gpt2::{Config, Linear, Norm, Weights};
-use crate::gpu::{Binds, Gpu, Rec};
+use crate::gpu::{Gpu, Rec};
 use crate::ops::{self, Epilogue};
 use crate::tensor::{GpuTensor, Tensor, numel};
 
@@ -114,12 +115,6 @@ pub fn hidden(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<GpuTensor> {
     Ok(h)
 }
 
-/// Where a forward pass puts its intermediates: new buffers, or the workspace's (D59).
-enum Bufs<'w> {
-    Alloc,
-    Workspace(&'w WsBuffers),
-}
-
 /// The intermediates a forward pass writes. In the workspace each one is a fixed buffer; the
 /// residual stream alternates between `ResA` and `ResB`.
 #[derive(Clone, Copy)]
@@ -135,13 +130,10 @@ enum Role {
     Logits,
 }
 
-impl Bufs<'_> {
-    /// A tensor of `shape` for `role`'s output: a new buffer, or a view of the workspace's.
-    fn out(&self, gpu: &Gpu, role: Role, shape: &[usize]) -> Result<GpuTensor> {
-        match self {
-            Bufs::Alloc => Ok(gpu.alloc(shape)),
-            Bufs::Workspace(ws) => ws.bufs[role as usize].view(shape),
-        }
+impl Role {
+    /// The workspace buffer index (`Bufs::out`).
+    fn at(self) -> usize {
+        self as usize
     }
 }
 
@@ -174,14 +166,14 @@ fn run(
         Attend::Recompute => 0,
         Attend::Cached { start, .. } => *start,
     };
-    let mut x = bufs.out(gpu, Role::ResA, &[t, e])?;
+    let mut x = bufs.out(gpu, Role::ResA.at(), &[t, e])?;
     ops::embed_into(rec, &w.wte_t, &w.wpe, ids, ids_buf, start, &x)?;
     let n_head = w.config.n_head;
     let heads = ops::Heads::mha(n_head);
     for (l, b) in w.blocks.iter().enumerate() {
         x = block(rec, bufs, w, b, &x, |rec, qkv, out| {
             let parts_shape = ops::attention_parts_shape(t, start, e, n_head);
-            let parts = bufs.out(gpu, Role::Parts, &parts_shape)?;
+            let parts = bufs.out(gpu, Role::Parts.at(), &parts_shape)?;
             match attend {
                 Attend::Recompute => {
                     // A temporary cache of just these rows: the M2 op, a special case of D31.
@@ -197,7 +189,7 @@ fn run(
             }
         })?;
     }
-    let h = bufs.out(gpu, Role::Norm, &[t, e])?;
+    let h = bufs.out(gpu, Role::Norm.at(), &[t, e])?;
     ops::layer_norm_into(rec, &x, &w.ln_f.gain, &w.ln_f.bias, w.config.ln_eps, &h)?;
     Ok(h)
 }
@@ -220,7 +212,7 @@ fn block(
     let &[t, e] = x.shape() else {
         return Err(Error::Shape(format!("block: x {:?}", x.shape())));
     };
-    let out = |role, cols| bufs.out(gpu, role, &[t, cols]);
+    let out = |role: Role, cols| bufs.out(gpu, role.at(), &[t, cols]);
 
     let h = out(Role::Norm, e)?;
     ops::layer_norm_into(rec, x, &b.ln_1.gain, &b.ln_1.bias, eps, &h)?;
@@ -275,46 +267,25 @@ pub fn next_logits(gpu: &Gpu, w: &GpuWeights, ids: &[u32]) -> Result<Vec<f32>> {
 /// The tied LM head on the last row of `h: [T, E]`, recorded: `[1, V]`.
 fn last_logits(rec: &mut Rec, bufs: &Bufs, w: &GpuWeights, h: &GpuTensor) -> Result<GpuTensor> {
     let gpu = rec.gpu;
-    let last = bufs.out(gpu, Role::Last, &[1, w.config.n_embd])?;
+    let last = bufs.out(gpu, Role::Last.at(), &[1, w.config.n_embd])?;
     ops::row_into(rec, h, h.shape()[0] - 1, &last)?;
-    let logits = bufs.out(gpu, Role::Logits, &[1, w.config.vocab_size])?;
+    let logits = bufs.out(gpu, Role::Logits.at(), &[1, w.config.vocab_size])?;
     ops::linear_into(rec, &last, &w.wte_t, None, Epilogue::None, &logits)?;
     Ok(logits)
 }
 
-/// Per-layer K and V for every position so far (D30), and the workspace the cached path runs
-/// on (D59). Rows `0..len` are valid; rows past `len` hold stale data from earlier use and are
-/// never read (attention reads rows `0..=pos`).
-pub struct KvCache {
-    layers: Vec<(GpuTensor, GpuTensor)>,
-    len: usize,
-    ws: Workspace,
-}
+pub use crate::cache::KvCache;
 
-/// The fixed buffers of the cached path (D59): one per `Role`, each for `n_ctx` rows, plus the
-/// token ids and the readback buffer, and the bind groups made over them. Allocated once, so a
-/// steady-state decode step creates no GPU objects (D60).
-struct Workspace {
-    bufs: WsBuffers,
-    binds: Binds,
-}
-
-struct WsBuffers {
-    /// Indexed by `Role as usize`.
-    bufs: Vec<GpuTensor>,
-    ids: wgpu::Buffer,
-    staging: wgpu::Buffer,
-}
-
-impl Workspace {
-    fn new(gpu: &Gpu, config: &Config) -> Self {
-        let (rows, e, v) = (config.n_ctx, config.n_embd, config.vocab_size);
-        let h = config.n_head;
+/// GPT-2's workspace (D59): the residual stream twice, the LayerNorm output, qkv, the heads'
+/// output and their chunk partials (D63), the MLP's 4E, the last row and the logits, each for
+/// `n_ctx` rows. 87 MB for GPT-2 124M, 52 MB of it the partials; K and V add 75.5 MB.
+impl CacheModel for Config {
+    fn cache_layout(&self, rows: usize) -> CacheLayout {
+        let (e, v, h) = (self.n_embd, self.vocab_size, self.n_head);
         // GPT-2's MLP is 4E wide; another width fails `Bufs::out`'s size check.
         let floats = |role| match role {
             Role::ResA | Role::ResB | Role::Norm | Role::Att => rows * e,
             Role::Qkv => rows * 3 * e,
-            // Attention's chunk partials for a full prefill (D63): 52 MB for GPT-2 124M.
             Role::Parts => numel(&ops::attention_parts_shape(rows, 0, e, h)),
             Role::Fc => rows * 4 * e,
             Role::Last => e,
@@ -331,63 +302,22 @@ impl Workspace {
             Role::Last,
             Role::Logits,
         ];
-        debug_assert!(roles.iter().enumerate().all(|(i, &r)| r as usize == i));
-        Workspace {
-            bufs: WsBuffers {
-                bufs: roles.iter().map(|&r| gpu.alloc(&[floats(r)])).collect(),
-                ids: gpu.upload_u32(&vec![0; rows]),
-                staging: gpu.staging(v),
-            },
-            binds: Binds::default(),
-        }
-    }
-}
-
-impl KvCache {
-    /// Allocate K and V of `[n_ctx, E]` for every layer (75.5 MB for GPT-2 124M) and the
-    /// workspace (D59, D63; 87 MB for GPT-2 124M, 52 MB of it attention's chunk partials).
-    pub fn new(gpu: &Gpu, config: &Config) -> Self {
-        let shape = [config.n_ctx, config.n_embd];
-        KvCache {
-            layers: (0..config.n_layer)
-                .map(|_| (gpu.alloc(&shape), gpu.alloc(&shape)))
-                .collect(),
-            len: 0,
-            ws: Workspace::new(gpu, config),
+        debug_assert!(roles.iter().enumerate().all(|(i, &r)| r.at() == i));
+        CacheLayout {
+            n_layer: self.n_layer,
+            n_ctx: rows,
+            kv_width: e,
+            roles: roles.iter().map(|&r| floats(r)).collect(),
+            readback: v,
         }
     }
 
-    /// Positions cached so far: the next token goes to position `len`.
-    pub fn len(&self) -> usize {
-        self.len
+    fn default_ctx(&self) -> usize {
+        self.n_ctx
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Start a new sequence. Old rows are simply overwritten as the new one grows.
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    /// Forget every position from `len` on, keeping the first `len` (the next token goes to
-    /// position `len`). Rows `0..len` are untouched, so they stay exactly what the prefix
-    /// computed; the rest are overwritten as the sequence grows again. Fails past the end.
-    pub fn truncate(&mut self, len: usize) -> Result<()> {
-        if len > self.len {
-            return Err(Error::Input(format!(
-                "truncate to {len}: the cache holds only {}",
-                self.len
-            )));
-        }
-        self.len = len;
-        Ok(())
-    }
-
-    /// Bind groups the workspace has made so far (D59): constant once every shape has run.
-    pub fn bind_groups(&self) -> usize {
-        self.ws.binds.len()
+    fn max_ctx(&self) -> usize {
+        self.n_ctx
     }
 }
 
@@ -396,34 +326,10 @@ impl KvCache {
 /// each decode step is a call with one token. One recording and one submit (D58) on the
 /// cache's workspace (D59).
 pub fn extend(gpu: &Gpu, w: &GpuWeights, cache: &mut KvCache, ids: &[u32]) -> Result<Vec<f32>> {
-    if ids.is_empty() {
-        return Err(Error::Input("empty token sequence".into()));
-    }
-    // A cache built for a model with fewer layers would leave the later blocks without one.
-    if cache.layers.len() != w.blocks.len() {
-        return Err(Error::Shape(format!(
-            "KV cache has {} layers, the model {}",
-            cache.layers.len(),
-            w.blocks.len()
-        )));
-    }
-    let start = cache.len;
-    if start + ids.len() > w.config.n_ctx {
-        return Err(Error::Input(format!(
-            "positions {start}..{} exceed the context length {}",
-            start + ids.len(),
-            w.config.n_ctx
-        )));
-    }
-    let Workspace { bufs, binds } = &mut cache.ws;
-    let bufs = &*bufs;
-    let mut rec = gpu.rec_with(binds);
-    if (bufs.ids.size() as usize) < ids.len() * 4 {
-        return Err(Error::Shape(format!(
-            "workspace: {} ids don't fit its id buffer",
-            ids.len()
-        )));
-    }
+    let start = cache.check_extend(w.blocks.len(), ids.len())?;
+    let ws = &mut cache.ws;
+    let bufs = &ws.bufs;
+    let mut rec = gpu.rec_with(&mut ws.binds);
     rec.write(&bufs.ids, ids);
     let ws = Bufs::Workspace(bufs);
     let attend = Attend::Cached {

@@ -3,6 +3,7 @@
 
 mod config;
 mod forward;
+pub mod gpu;
 mod weights;
 
 pub use config::Config;

@@ -1091,6 +1091,15 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
   take their sizes from the model; the CLI gets `--model gpt2 | smollm2-135m`.
 - **Alternatives:** one generic model abstraction over both (more indirection than two models
   justify).
+- **Built (§4):** `src/cache.rs` holds `KvCache`, the workspace and `Bufs` for both models; a
+  model implements `CacheModel` (its `CacheLayout`: layers, positions, K/V row width, floats per
+  workspace role). GPT-2 moved onto it with bit-identical output. Llama has no position
+  embedding: `embed.wgsl` gains an override `POSITIONS` (0 = the gather alone, compiled as a
+  second pipeline, `ops::gather`). `src/llama/gpu.rs` runs the CPU's op sequence with RoPE in
+  place before K is cached. Results: SmolLM2-135M on the GPU gives numpy's greedy tokens on
+  all 4 prompts with the KV cache; GPU vs CPU logits within 4.2e-4; cached decode bitwise equal
+  to full recompute (tiny model across the 64-key chunk boundary, SmolLM2 for 8 steps); a
+  decode step creates no GPU objects (D60).
 
 ### D75: The tokenizer learns digits and special tokens
 - **What:** SmolLM2 uses GPT-2's byte-level BPE with two additions: digits are split one by

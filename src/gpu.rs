@@ -41,6 +41,7 @@ pub(crate) struct Kernels {
     pub add: Kernel,
     pub gelu: Kernel,
     pub embed: Kernel,
+    pub gather: Kernel,
     pub softmax: Kernel,
     pub layer_norm: Kernel,
     pub rms_norm: Kernel,
@@ -134,6 +135,12 @@ impl Gpu {
                 &[gelu_fn, include_str!("shaders/gelu.wgsl")].concat(),
             ),
             embed: k("embed", include_str!("shaders/embed.wgsl")),
+            gather: compute_pipeline(
+                &device,
+                "gather",
+                include_str!("shaders/embed.wgsl"),
+                &[("POSITIONS", 0.0)],
+            ),
             softmax: k(
                 "softmax",
                 &with_reduce(include_str!("shaders/softmax.wgsl")),

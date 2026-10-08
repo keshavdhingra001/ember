@@ -144,3 +144,25 @@ fn gpt2_workspace_path_matches_one_op_at_a_time() {
     let gw = GpuWeights::upload(g, &Weights::load(&dir).unwrap()).unwrap();
     check_against_one_op(g, &gw, &[40, 2883, 6155, 351, 616], &[13, 314]);
 }
+
+#[test]
+fn a_llama_decode_step_creates_no_gpu_objects() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap();
+    let g = gpu();
+    let w = ember::llama::Weights::load(&common::tiny_llama_dir()).unwrap();
+    let gw = ember::llama::gpu::GpuWeights::upload(g, &w).unwrap();
+    let mut cache = ember::llama::gpu::KvCache::new(g, &gw.config);
+    let extend = ember::llama::gpu::extend;
+    extend(g, &gw, &mut cache, &[1, 5, 9, 2]).unwrap();
+    extend(g, &gw, &mut cache, &[3]).unwrap();
+    let (created, binds) = (g.created(), cache.bind_groups());
+    for id in [4, 30, 0] {
+        extend(g, &gw, &mut cache, &[id]).unwrap();
+    }
+    assert_eq!(
+        g.created() - created,
+        0,
+        "GPU objects created by 3 decode steps"
+    );
+    assert_eq!(cache.bind_groups(), binds);
+}
