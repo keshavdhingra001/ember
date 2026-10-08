@@ -2,7 +2,7 @@
 //! `tokenize` (BPE, step by step), `generate` (greedy decoding on the GPU with a KV cache, or
 //! without one, or on the CPU reference), `bench` (prefill and decode timings, D35), `profile`
 //! (per-kernel GPU times, D36-D41) and `matmul` (the linear kernels vs the roofs, D47). The model
-//! commands take `--model gpt2 | smollm2-135m` (D74; GPT-2 by default). Wall-clock timing lives
+//! commands take `--model gpt2 | smollm2-135m | smollm2-360m` (D74; GPT-2 by default). Wall-clock timing lives
 //! here, in the CLI, never in the engine (D4).
 
 use std::io::Write;
@@ -19,10 +19,15 @@ use ember::profile::{self, KernelTime};
 use ember::rng::Rng;
 use ember::{Gpu, GpuTensor, Tensor, Tokenizer, cpu, ops};
 
-const USAGE: &str = "usage: ember [info | selftest | tokenize [--model M] <text>\n              | generate [--model M] [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [--model M] [-n <tokens>] <prompt>\n              | profile [--model M] [-n <runs>] <prompt>\n              | matmul [-n <runs>]]\n       M: gpt2 (default) | smollm2-135m";
+const USAGE: &str = "usage: ember [info | selftest | tokenize [--model M] <text>\n              | generate [--model M] [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [--model M] [-n <tokens>] <prompt>\n              | profile [--model M] [-n <runs>] <prompt>\n              | matmul [-n <runs>]]\n       M: gpt2 (default) | smollm2-135m | smollm2-360m";
 
 /// The models the CLI knows, and where their files live (fetched by scripts/fetch_*.sh).
-const MODELS: [(&str, &str); 2] = [("gpt2", "data/gpt2"), ("smollm2-135m", "data/smollm2-135m")];
+/// SmolLM2-360M needs no code of its own (D67).
+const MODELS: [(&str, &str); 3] = [
+    ("gpt2", "data/gpt2"),
+    ("smollm2-135m", "data/smollm2-135m"),
+    ("smollm2-360m", "data/smollm2-360m"),
+];
 
 /// A model's CPU weights: the reference, and the source of the GPU upload.
 enum Model {
@@ -806,7 +811,7 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_opts, prompt_opts, take_utf8};
+    use super::{MODELS, USAGE, load_tokenizer, parse_opts, prompt_opts, take_utf8};
 
     fn args(s: &str) -> Vec<String> {
         s.split(' ')
@@ -833,6 +838,21 @@ mod tests {
         // After the first prompt word, `-n` is text. A lone `-` word is text too.
         let o = parse_opts(&args("say -n - twice"), 20, &[]).unwrap();
         assert_eq!((o.n, o.prompt.as_str()), (20, "say -n - twice"));
+    }
+
+    #[test]
+    fn usage_lists_every_model() {
+        let line = USAGE.lines().last().unwrap();
+        let listed: Vec<&str> = line
+            .split(['|', ' ', ':'])
+            .filter(|w| w.contains('-') || *w == "gpt2")
+            .collect();
+        let known: Vec<&str> = MODELS.iter().map(|m| m.0).collect();
+        assert_eq!(listed, known, "{line}");
+        let Err(e) = load_tokenizer("smollm2-1.7b") else {
+            panic!("an unknown model was accepted");
+        };
+        assert!(e.to_string().contains("smollm2-360m"), "{e}");
     }
 
     #[test]
