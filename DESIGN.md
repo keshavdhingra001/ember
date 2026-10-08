@@ -1118,3 +1118,11 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
 ### D76: The KV cache is sized for 2048 positions by default
 - **What:** `n_ctx` for the cache and workspace defaults to 2048 (configurable), below the
   model's 8192: at 8192 the cache alone would be 30 × 2 × 8192 × 192 × 4 B = 377 MB.
+- **Review fix (2026-10-08):** that arithmetic missed the biggest buffer. The workspace holds
+  attention's chunk partials for a full-length prefill (D63), `n_ctx × heads × n_ctx/64 ×
+  (d + 2)` floats: quadratic in positions. SmolLM2-135M: 156 MB at 2048, 2.49 GB at 8192,
+  past this device's 2047 MiB buffer limit, and `KvCache::with_ctx(8192)` was accepted and
+  then panicked inside wgpu. `with_ctx` and every `Bufs::Alloc` intermediate now check the
+  size against the device's limits first and return an error. Bounding the partials (a
+  prefill cut into chunks of rows, so the buffer is `rows_max × heads × chunks × (d + 2)`) is
+  left for when a long-context run needs it.

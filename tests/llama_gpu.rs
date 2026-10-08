@@ -190,3 +190,49 @@ fn smollm2_360m_runs_by_config_alone() {
     assert_eq!(gpu, cpu);
     eprintln!("360M continues: {:?}", tok.decode(&gpu).unwrap());
 }
+
+#[test]
+fn a_cache_too_big_for_the_device_is_refused() {
+    // SmolLM2-135M's shape at its full 8192 positions, no weights needed. Attention's chunk
+    // partials for a full-length prefill (D63) grow with positions squared: 8192 rows x 9 heads
+    // x 128 chunks x 66 floats = 2.49 GB, past any buffer this device takes. The cache must say
+    // so, not hand the driver a buffer it rejects.
+    let g = gpu();
+    let c = llama::Config {
+        n_layer: 30,
+        n_head: 9,
+        n_kv_head: 3,
+        n_embd: 576,
+        n_ff: 1536,
+        vocab_size: 49152,
+        n_ctx: 8192,
+        rope_theta: 100000.0,
+        rms_eps: 1e-5,
+    };
+    let limit = g
+        .limits
+        .max_storage_buffer_binding_size
+        .min(g.limits.max_buffer_size);
+    assert!(
+        limit < 8192 * 9 * 128 * 66 * 4,
+        "this device takes the buffer"
+    );
+    match KvCache::with_ctx(g, &c, 8192) {
+        Ok(_) => panic!("a cache of 8192 positions was accepted"),
+        Err(e) => assert!(e.to_string().contains("exceeds"), "{e}"),
+    }
+    // The default size fits.
+    assert_eq!(KvCache::new(g, &c).n_ctx(), 2048);
+}
+
+#[test]
+fn a_recompute_too_big_for_the_device_is_refused() {
+    // The uncached path allocates the same partials per call: the tiny model (6 heads, d = 4)
+    // at 32768 positions needs 32768 x 6 x 512 x 6 floats = 2.4 GB of them.
+    let g = gpu();
+    let mut w = Weights::load(&tiny_llama_dir()).unwrap();
+    w.config.n_ctx = 32768;
+    let gw = GpuWeights::upload(g, &w).unwrap();
+    let e = llama_gpu::next_logits(g, &gw, &vec![1; 32768]).unwrap_err();
+    assert!(e.to_string().contains("exceeds"), "{e}");
+}

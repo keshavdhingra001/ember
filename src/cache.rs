@@ -4,8 +4,8 @@
 //! themselves (which intermediate lives where) stay the model's business.
 
 use crate::error::{Error, Result};
-use crate::gpu::{Binds, Gpu};
-use crate::tensor::GpuTensor;
+use crate::gpu::{Binds, Gpu, byte_size};
+use crate::tensor::{GpuTensor, numel};
 
 /// What a model asks of a cache.
 pub struct CacheLayout {
@@ -71,6 +71,19 @@ impl KvCache {
         }
         let l = model.cache_layout(n_ctx);
         let shape = [n_ctx, l.kv_width];
+        // Check before allocating: the driver rejects an oversized buffer with a panic, not an
+        // error. Attention's partials (D63) grow with positions squared and hit this first
+        // (SmolLM2-135M at 8192 positions: 2.49 GB, D76).
+        let floats = l
+            .roles
+            .iter()
+            .copied()
+            .chain([n_ctx * l.kv_width, l.readback]);
+        check_fits(
+            gpu,
+            &format!("a cache of {n_ctx} positions"),
+            floats.max().unwrap_or(0),
+        )?;
         Ok(KvCache {
             layers: (0..l.n_layer)
                 .map(|_| (gpu.alloc(&shape), gpu.alloc(&shape)))
@@ -167,8 +180,30 @@ impl Bufs<'_> {
     /// view of the workspace's.
     pub fn out(&self, gpu: &Gpu, role: usize, shape: &[usize]) -> Result<GpuTensor> {
         match self {
-            Bufs::Alloc => Ok(gpu.alloc(shape)),
+            Bufs::Alloc => {
+                check_fits(gpu, &format!("a {shape:?} intermediate"), numel(shape))?;
+                Ok(gpu.alloc(shape))
+            }
             Bufs::Workspace(ws) => ws.bufs[role].view(shape),
         }
     }
+}
+
+/// An error if a buffer of `floats` f32s is more than the device takes. Checked before
+/// allocating: the driver rejects an oversized buffer with a panic, not an error. Attention's
+/// partials (D63) grow with positions squared and hit this first (SmolLM2-135M at 8192
+/// positions: 2.49 GB, D76).
+fn check_fits(gpu: &Gpu, what: &str, floats: usize) -> Result<()> {
+    let limit = gpu
+        .limits
+        .max_storage_buffer_binding_size
+        .min(gpu.limits.max_buffer_size);
+    if byte_size(floats) > limit {
+        return Err(Error::Input(format!(
+            "{what} needs a {} MB buffer, which exceeds the device's {} MB",
+            byte_size(floats) >> 20,
+            limit >> 20
+        )));
+    }
+    Ok(())
 }
