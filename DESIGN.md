@@ -1107,7 +1107,9 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
   matched whole before BPE. Both are read from `tokenizer.json`; GPT-2's ids don't change.
 - **Built (§1):** `Tokenizer::load_hf` reads `tokenizer.json` and refuses every setting it
   doesn't implement (a normalizer, `add_prefix_space`, an unknown token, byte fallback,
-  `ignore_merges`, subword prefixes, non-special or stripping added tokens). Found on the
+  `ignore_merges`, subword prefixes, non-special or stripping added tokens, and, since the M8
+  review, a post-processor or decoder other than `ByteLevel`: a template that adds a BOS
+  token, as Llama 3's does, would otherwise give different ids without a word). Found on the
   way: SmolLM2's vocabulary has no token for 21 bytes (six control characters and bytes valid
   UTF-8 almost never uses: 0xC0, 0xC1, 0xF1, 0xF2, 0xF5–0xFF). Hugging Face, with no unknown
   token, drops such a byte before merging, so ember does too; `load` (GPT-2) still requires

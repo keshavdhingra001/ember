@@ -181,6 +181,14 @@ impl Tokenizer {
         } else {
             return Err(format!("unsupported pre-tokenizer {pre}"));
         };
+        // After BPE: a post-processor that adds tokens (a BOS, a template) would change the
+        // ids, and a decoder other than byte-level would change the text. ByteLevel's only
+        // touches offsets, which ember doesn't report.
+        for key in ["post_processor", "decoder"] {
+            if !(t[key].is_null() || t[key]["type"] == "ByteLevel") {
+                return Err(format!("unsupported {key} {}", t[key]));
+            }
+        }
         // Plain BPE as `bpe` implements it. GPT-2's older file has no "type".
         let model = &t["model"];
         let empty = |v: &Value| v.is_null() || *v == "";
@@ -550,6 +558,15 @@ mod tests {
             hf_json(byte_level).replace(r#""type": "BPE""#, r#""type": "WordPiece""#),
             hf_json(byte_level).replace(r#""id": 260"#, r#""id": 7"#), // not its vocab id
             hf_json(byte_level).replace(r#""special": true}]"#, r#""special": false}]"#),
+            // Llama 3 style: a template that puts a BOS token in front.
+            hf_json(byte_level).replace(
+                r#""normalizer": null"#,
+                r#""normalizer": null, "post_processor": {"type": "TemplateProcessing"}"#,
+            ),
+            hf_json(byte_level).replace(
+                r#""normalizer": null"#,
+                r#""normalizer": null, "decoder": {"type": "Metaspace"}"#,
+            ),
         ];
         for json in bad {
             assert_ne!(json, hf_json(byte_level), "the case must change the file");
@@ -557,6 +574,12 @@ mod tests {
             assert!(t.apply_hf(&json).is_err(), "accepted {json}");
         }
         assert!(toy_hf().apply_hf(&hf_json(byte_level)).is_ok());
+        // SmolLM2's own: no post-processor, a ByteLevel decoder.
+        let smol = hf_json(byte_level).replace(
+            r#""normalizer": null"#,
+            r#""normalizer": null, "post_processor": null, "decoder": {"type": "ByteLevel"}"#,
+        );
+        assert!(toy_hf().apply_hf(&smol).is_ok());
     }
 
     #[test]
