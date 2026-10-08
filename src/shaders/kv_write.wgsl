@@ -1,13 +1,14 @@
-// Append K and V rows to a layer's cache (D32): for t in 0..T and c in 0..E,
-//   k_cache[start + t, c] = qkv[t, E + c]      (the K third of the qkv row)
-//   v_cache[start + t, c] = qkv[t, 2E + c]     (the V third)
+// Append K and V rows to a layer's cache (D32). A qkv row is [q (Q) | k (KV) | v (KV)] with
+// Q = n_head d and KV = n_kv_head d (D71; GPT-2 has KV = Q = E). For t in 0..T and c in 0..KV,
+//   k_cache[start + t, c] = qkv[t, Q + c]
+//   v_cache[start + t, c] = qkv[t, Q + KV + c]
 // One invocation per (t, c), grid-stride (D8). The host checks start + T <= n_ctx.
 
 struct Params {
-    n: u32,      // T * E
-    e: u32,
+    n: u32,      // T * KV
+    kv: u32,     // cache row width, n_kv_head * d
     start: u32,  // absolute position of qkv row 0
-    _pad: u32,
+    q: u32,      // query width, n_head * d
 }
 
 @group(0) @binding(0) var<storage, read> qkv: array<f32>;
@@ -23,12 +24,13 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let stride = nwg.x * WG;
-    let e = params.e;
+    let kv = params.kv;
+    let row = params.q + 2u * kv;
     for (var i = gid.x; i < params.n; i += stride) {
-        let t = i / e;
-        let c = i % e;
-        let dst = (params.start + t) * e + c;
-        k_cache[dst] = qkv[t * 3u * e + e + c];
-        v_cache[dst] = qkv[t * 3u * e + 2u * e + c];
+        let t = i / kv;
+        let c = i % kv;
+        let dst = (params.start + t) * kv + c;
+        k_cache[dst] = qkv[t * row + params.q + c];
+        v_cache[dst] = qkv[t * row + params.q + kv + c];
     }
 }

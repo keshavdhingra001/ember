@@ -43,6 +43,9 @@ pub(crate) struct Kernels {
     pub embed: Kernel,
     pub softmax: Kernel,
     pub layer_norm: Kernel,
+    pub rms_norm: Kernel,
+    pub rope: Kernel,
+    pub silu_mul: Kernel,
     pub linear_naive: Kernel,
     // The linear kernels, each compiled once per epilogue (D62), indexed by `Epilogue::index`.
     pub matmul: [Kernel; 3],
@@ -139,6 +142,12 @@ impl Gpu {
                 "layer_norm",
                 &with_reduce(include_str!("shaders/layer_norm.wgsl")),
             ),
+            rms_norm: k(
+                "rms_norm",
+                &with_reduce(include_str!("shaders/rms_norm.wgsl")),
+            ),
+            rope: k("rope", include_str!("shaders/rope.wgsl")),
+            silu_mul: k("silu_mul", include_str!("shaders/silu_mul.wgsl")),
             linear_naive: k("linear_naive", include_str!("shaders/linear_naive.wgsl")),
             matmul: linear(
                 ["matmul", "matmul+gelu", "matmul+res"],
@@ -331,7 +340,7 @@ const TENSOR_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
 
 /// Buffer size for `n` f32s. Never 0: a zero-sized buffer can't be bound, and an empty tensor
 /// still needs a valid binding (the kernel just never touches it).
-fn byte_size(n: usize) -> u64 {
+pub(crate) fn byte_size(n: usize) -> u64 {
     (n.max(1) * 4) as u64
 }
 

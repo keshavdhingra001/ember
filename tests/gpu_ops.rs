@@ -556,7 +556,9 @@ fn attention_rejects_wide_heads_and_small_scratch() {
     let short = g.alloc(&[n - 1]);
     let out = g.alloc(&[t, e]);
     let mut rec = g.rec();
-    assert!(ops::attention_into(&mut rec, &qkv, &k, &v, 0, h, &short, &out).is_err());
+    assert!(
+        ops::attention_into(&mut rec, &qkv, &k, &v, 0, ops::Heads::mha(h), &short, &out).is_err()
+    );
 }
 
 // ------------------------------------------------------------------ row
@@ -801,7 +803,7 @@ fn into_ops_write_only_their_view() {
         .unwrap();
     let parts = g.alloc(&ops::attention_parts_shape(t, 4, e, h));
     into_oversized("attention", &[t, e], &want, |r, o| {
-        ops::attention_into(r, &qkv, &k, &vc, 4, h, &parts, o)
+        ops::attention_into(r, &qkv, &k, &vc, 4, ops::Heads::mha(h), &parts, o)
     });
 
     // Every linear kernel: matvec split / plain / wide, matvec_rows likewise, matmul; with and
@@ -890,4 +892,172 @@ fn residual_epilogue_rejects_bad_buffers() {
     assert!(ops::linear_into(&mut rec, &x, &w, None, ep(&wrong), &out).is_err());
     // In place would bind one buffer read-only and read-write at once.
     assert!(ops::linear_into(&mut rec, &x, &w, None, ep(&out), &out).is_err());
+}
+
+// ------------------------------------------------------------------ M8: Llama-family ops
+
+/// As LayerNorm: the CPU computes in f64, the GPU in f32 with a tree sum.
+const RMS_NORM_TOL: Tol = Tol {
+    abs: 2e-5,
+    rel: 1e-5,
+};
+
+#[test]
+fn rms_norm_matches_cpu() {
+    let g = gpu();
+    let shapes: [[usize; 2]; 6] = [[1, 1], [2, 255], [2, 256], [3, 257], [5, 576], [2, 1536]];
+    for (seed, shape) in shapes.into_iter().enumerate() {
+        let cols = shape[1];
+        let x = random(&shape, -20.0, 20.0, 300 + seed as u64);
+        let gain = random(&[cols], 0.5, 1.5, 400 + seed as u64);
+        let (gx, gg) = (g.upload(&x), g.upload(&gain));
+        compare(
+            &format!("rms_norm {shape:?}"),
+            &cpu::rms_norm(&x, &gain, 1e-5).unwrap(),
+            RMS_NORM_TOL,
+            || g.read(&ops::rms_norm(g, &gx, &gg, 1e-5).unwrap()).unwrap(),
+        );
+    }
+}
+
+/// exp differs between libm and the driver by a few ulp, as tanh does for GELU.
+const SILU_TOL: Tol = Tol {
+    abs: 1e-6,
+    rel: 1e-5,
+};
+
+#[test]
+fn silu_mul_matches_cpu() {
+    let g = gpu();
+    for (seed, (t, f)) in [(1, 1), (1, 255), (3, 257), (7, 1536)]
+        .into_iter()
+        .enumerate()
+    {
+        let gu = random(&[t, 2 * f], -12.0, 12.0, 500 + seed as u64);
+        let ggu = g.upload(&gu);
+        compare(
+            &format!("silu_mul T={t} F={f}"),
+            &cpu::silu_mul(&gu).unwrap(),
+            SILU_TOL,
+            || g.read(&ops::silu_mul(g, &ggu).unwrap()).unwrap(),
+        );
+    }
+}
+
+/// Two products and a sum per output from the same f32 inputs: a driver may fuse them into an
+/// fma, which rounds once instead of twice.
+const ROPE_TOL: Tol = Tol {
+    abs: 1e-6,
+    rel: 1e-6,
+};
+
+#[test]
+fn rope_matches_cpu() {
+    // SmolLM2's shape (9 query + 3 key heads rotated, 3 value heads not, d = 64, theta 1e5)
+    // and a small odd one, at positions from 0 and from 1000 (large angles).
+    let g = gpu();
+    let cases = [
+        (1, 12, 15, 64, 0, 100000.0),
+        (7, 12, 15, 64, 0, 100000.0),
+        (5, 12, 15, 64, 1000, 100000.0),
+        (3, 2, 3, 4, 7, 10000.0),
+    ];
+    for (seed, (t, n_rot, heads, d, start, theta)) in cases.into_iter().enumerate() {
+        let (cos, sin) = cpu::rope_tables(start + t, d, theta);
+        let (gc, gs) = (g.upload(&cos), g.upload(&sin));
+        let x = random(&[t, heads * d], -3.0, 3.0, 600 + seed as u64);
+        let gx = g.upload(&x);
+        let run = || {
+            g.read(&ops::rope(g, &gx, n_rot, d, start, &gc, &gs).unwrap())
+                .unwrap()
+        };
+        compare(
+            &format!("rope T={t} rot={n_rot}/{heads} d={d} from {start}"),
+            &cpu::rope(&x, n_rot, d, start, &cos, &sin).unwrap(),
+            ROPE_TOL,
+            run,
+        );
+        // The heads past n_rot (the values) are copied bit for bit.
+        let out = run();
+        for r in 0..t {
+            let tail = |v: &[f32]| v[r * heads * d + n_rot * d..(r + 1) * heads * d].to_vec();
+            assert_eq!(tail(out.data()), tail(x.data()), "values rotated");
+        }
+        // One position past the table is refused (the kernel would read past it).
+        assert!(ops::rope(g, &gx, n_rot, d, start + 1, &gc, &gs).is_err());
+    }
+}
+
+#[test]
+fn gqa_attention_matches_cpu() {
+    // Grouped heads at chunk boundaries: SmolLM2's 9 over 3 (d = 64), 6 over 2, 4 over 1, and
+    // 4 over 4 (plain multi-head through the same path).
+    let g = gpu();
+    let cases = [
+        (1, 9, 3, 64),
+        (63, 9, 3, 64),
+        (65, 9, 3, 64),
+        (130, 6, 2, 16),
+        (70, 4, 1, 8),
+        (20, 4, 4, 8),
+    ];
+    for (seed, (t, h, kv, d)) in cases.into_iter().enumerate() {
+        let qkv = random(&[t, (h + 2 * kv) * d], -2.0, 2.0, 700 + seed as u64);
+        let gq = g.upload(&qkv);
+        let heads = ops::Heads { q: h, kv };
+        compare(
+            &format!("gqa attention T={t} {h}/{kv} d={d}"),
+            &cpu::causal_attention_gqa(&qkv, h, kv).unwrap(),
+            ATTENTION_TOL,
+            || {
+                g.read(&ops::causal_attention_gqa(g, &gq, heads).unwrap())
+                    .unwrap()
+            },
+        );
+    }
+}
+
+#[test]
+fn gqa_cached_attention_continues_exactly() {
+    // D33 with grouped heads: prefill 50 rows, then the other 20 one at a time into the same
+    // cache; every row must have the bits of attending over all 70 at once.
+    let g = gpu();
+    let (t, h, kv, d) = (70, 9, 3, 64);
+    let w = (h + 2 * kv) * d;
+    let heads = ops::Heads { q: h, kv };
+    let qkv = random(&[t, w], -2.0, 2.0, 800);
+    let full = g
+        .read(&ops::causal_attention_gqa(g, &g.upload(&qkv), heads).unwrap())
+        .unwrap();
+    let (k, v) = (g.alloc(&[t, kv * d]), g.alloc(&[t, kv * d]));
+    let rows = |a: usize, b: usize| {
+        g.upload(&Tensor::new(&[b - a, w], qkv.data()[a * w..b * w].to_vec()).unwrap())
+    };
+    let mut got = Vec::new();
+    let mut at = 0;
+    for end in std::iter::once(50).chain(51..=t) {
+        let part = rows(at, end);
+        let mut rec = g.rec();
+        ops::kv_write_into(&mut rec, &part, &k, &v, at, heads).unwrap();
+        rec.submit();
+        let out = ops::attention_cached_gqa(g, &part, &k, &v, at, heads).unwrap();
+        got.extend_from_slice(g.read(&out).unwrap().data());
+        at = end;
+    }
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&got), bits(full.data()));
+}
+
+#[test]
+fn gqa_shapes_are_checked() {
+    let g = gpu();
+    let qkv = g.upload(&Tensor::zeros(&[4, (9 + 6) * 64]));
+    // 9 query heads don't group over 2 key/value heads; the row doesn't split into 9 + 2 x 4.
+    assert!(ops::causal_attention_gqa(g, &qkv, ops::Heads { q: 9, kv: 2 }).is_err());
+    assert!(ops::causal_attention_gqa(g, &qkv, ops::Heads { q: 7, kv: 7 }).is_err());
+    // A cache as wide as the queries (the GPT-2 layout) is the wrong width for 3 kv heads.
+    let wide = g.alloc(&[4, 9 * 64]);
+    let mut rec = g.rec();
+    let heads = ops::Heads { q: 9, kv: 3 };
+    assert!(ops::kv_write_into(&mut rec, &qkv, &wide, &wide, 0, heads).is_err());
 }

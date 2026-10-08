@@ -1,7 +1,9 @@
 // Causal multi-head attention with a KV cache, pass 1 of 2 (D63): one key chunk. Queries come
-// from qkv: [T, 3E] (the Q third of each row); keys and values from the layer's cache
-// k_cache, v_cache: [n_ctx, E], which already holds rows 0..start+T (kv_write ran first). Query
-// row i sits at absolute position pos = start + i and attends cache rows 0..=pos.
+// from qkv: [T, E + 2 KV] (the first E = n_head d columns of each row); keys and values from the
+// layer's cache k_cache, v_cache: [n_ctx, KV], KV = n_kv_head d, which already holds rows
+// 0..start+T (kv_write ran first). Query head h reads key/value head h / group (grouped-query
+// attention, D71; GPT-2 has group 1 and KV = E). Query row i sits at absolute position
+// pos = start + i and attends cache rows 0..=pos.
 //
 // Keys are cut into chunks of KC = 64 by absolute index: chunk c is keys 64c .. 64c + 63. One
 // workgroup per (query row i, head h, chunk c) computes, over the chunk's keys j <= pos,
@@ -23,8 +25,8 @@ struct Params {
     scale: f32,  // 1 / sqrt(d), computed on the host so both sides use the same f32
     start: u32,
     n_chunks: u32,  // chunks per (row, head) in parts: ceil((start + t) / KC)
-    _pad0: u32,
-    _pad1: u32,
+    kv: u32,        // cache row width, n_kv_head * d
+    group: u32,     // query heads per key/value head
 }
 
 @group(0) @binding(0) var<storage, read> qkv: array<f32>;
@@ -57,7 +59,9 @@ fn main(
     let l = lid.x;
     let e = params.e;
     let d = params.d;
-    let hd = h * d;               // this head's column offset within Q, K and V
+    let hd = h * d;               // this query head's column offset within Q
+    let kvd = (h / params.group) * d;  // its key/value head's column offset within K and V
+    let kv = params.kv;
     let pos = params.start + i;   // absolute position of this query
     let j0 = c * KC;              // first key of the chunk
     // Chunks past pos have no keys for this row. The whole workgroup leaves together, so no
@@ -68,7 +72,7 @@ fn main(
     let n = min(KC, pos + 1u - j0);  // keys of this chunk that this row attends
 
     for (var cc = l; cc < d; cc += WG) {
-        qs[cc] = qkv[i * 3u * e + hd + cc];
+        qs[cc] = qkv[i * (e + 2u * kv) + hd + cc];
     }
 
     // 1. Scores, 32 keys at a time; thread l scores key l (in half l / 32). Only the halves
@@ -82,7 +86,7 @@ fn main(
         let rows = min(HALF, n - h0);
         for (var r = 0u; r < rows; r++) {
             if (l < d) {
-                ks[r * STRIDE + l] = k_cache[(j0 + h0 + r) * e + hd + l];
+                ks[r * STRIDE + l] = k_cache[(j0 + h0 + r) * kv + kvd + l];
             }
         }
         workgroupBarrier();  // the half is staged (and q, the first time)
@@ -110,7 +114,7 @@ fn main(
     for (var cc = l; cc < d; cc += WG) {
         var acc = 0.0;
         for (var r = 0u; r < n; r++) {
-            acc += ps[r] * v_cache[(j0 + r) * e + hd + cc];
+            acc += ps[r] * v_cache[(j0 + r) * kv + kvd + cc];
         }
         parts[base + 2u + cc] = acc;
     }

@@ -177,6 +177,7 @@ fn run(
     let mut x = bufs.out(gpu, Role::ResA, &[t, e])?;
     ops::embed_into(rec, &w.wte_t, &w.wpe, ids, ids_buf, start, &x)?;
     let n_head = w.config.n_head;
+    let heads = ops::Heads::mha(n_head);
     for (l, b) in w.blocks.iter().enumerate() {
         x = block(rec, bufs, w, b, &x, |rec, qkv, out| {
             let parts_shape = ops::attention_parts_shape(t, start, e, n_head);
@@ -185,13 +186,13 @@ fn run(
                 Attend::Recompute => {
                     // A temporary cache of just these rows: the M2 op, a special case of D31.
                     let (k, v) = (gpu.alloc(&[t, e]), gpu.alloc(&[t, e]));
-                    ops::kv_write_into(rec, qkv, &k, &v, 0)?;
-                    ops::attention_into(rec, qkv, &k, &v, 0, n_head, &parts, out)
+                    ops::kv_write_into(rec, qkv, &k, &v, 0, heads)?;
+                    ops::attention_into(rec, qkv, &k, &v, 0, heads, &parts, out)
                 }
                 Attend::Cached { layers, start } => {
                     let (k, v) = &layers[l];
-                    ops::kv_write_into(rec, qkv, k, v, *start)?;
-                    ops::attention_into(rec, qkv, k, v, *start, n_head, &parts, out)
+                    ops::kv_write_into(rec, qkv, k, v, *start, heads)?;
+                    ops::attention_into(rec, qkv, k, v, *start, heads, &parts, out)
                 }
             }
         })?;

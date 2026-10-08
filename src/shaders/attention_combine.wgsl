@@ -14,8 +14,8 @@ struct Params {
     scale: f32,  // unused here; the layout matches pass 1's
     start: u32,
     n_chunks: u32,
-    _pad0: u32,
-    _pad1: u32,
+    kv: u32,     // unused here
+    group: u32,  // unused here
 }
 
 @group(0) @binding(0) var<storage, read> parts: array<f32>;

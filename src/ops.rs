@@ -284,6 +284,132 @@ pub fn layer_norm_into(
     )
 }
 
+/// RMSNorm of each row of `x: [rows, cols]` with `gain: [cols]` (see `cpu::rms_norm`).
+pub fn rms_norm(gpu: &Gpu, x: &GpuTensor, gain: &GpuTensor, eps: f32) -> Result<GpuTensor> {
+    once(gpu, x.shape(), |rec, out| {
+        rms_norm_into(rec, x, gain, eps, out)
+    })
+}
+
+/// `rms_norm` into `out` (D61).
+pub fn rms_norm_into(
+    rec: &mut Rec,
+    x: &GpuTensor,
+    gain: &GpuTensor,
+    eps: f32,
+    out: &GpuTensor,
+) -> Result<()> {
+    shape::rms_norm(x.shape(), gain.shape())?;
+    let (rows, cols) = rows_cols(rec.gpu, "rms_norm", x)?;
+    check_out("rms_norm", out, x.shape())?;
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    rec.dispatch(
+        &rec.gpu.kernels.rms_norm,
+        &[&x.buffer, &gain.buffer, &out.buffer],
+        bytemuck::bytes_of(&Params4::new(cols, eps.to_bits(), 0, 0)),
+        (rows, 1, 1),
+    )
+}
+
+/// SwiGLU's gate: `gu: [T, 2F]` (gate columns, then up) -> `silu(gate) * up`, `[T, F]`.
+pub fn silu_mul(gpu: &Gpu, gu: &GpuTensor) -> Result<GpuTensor> {
+    let (t, f) = silu_mul_dims(gu)?;
+    once(gpu, &[t, f], |rec, out| silu_mul_into(rec, gu, out))
+}
+
+fn silu_mul_dims(gu: &GpuTensor) -> Result<(usize, usize)> {
+    match *gu.shape() {
+        [t, two_f] if two_f.is_multiple_of(2) => Ok((t, two_f / 2)),
+        _ => Err(Error::Shape(format!(
+            "silu_mul: {:?} must be [T, 2F]",
+            gu.shape()
+        ))),
+    }
+}
+
+/// `silu_mul` into `out` (D61).
+pub fn silu_mul_into(rec: &mut Rec, gu: &GpuTensor, out: &GpuTensor) -> Result<()> {
+    let (t, f) = silu_mul_dims(gu)?;
+    check_out("silu_mul", out, &[t, f])?;
+    if t * f == 0 {
+        return Ok(());
+    }
+    let kernel = &rec.gpu.kernels.silu_mul;
+    elementwise(
+        rec,
+        kernel,
+        &[&gu.buffer, &out.buffer],
+        Params4::new(len_u32(t * f)?, f as u32, 0, 0),
+        rec.gpu.max_groups(),
+    )
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RopeParams {
+    n: u32,
+    w: u32,
+    half: u32,
+    start: u32,
+    n_rot: u32,
+    _pad: [u32; 3],
+}
+
+/// Rotary position embedding (D70) on a copy of `x: [T, W]`: the first `n_rot` heads of width
+/// `d` of each row, rows at positions `start..`, tables `[n_pos, d/2]` from `cpu::rope_tables`.
+pub fn rope(
+    gpu: &Gpu,
+    x: &GpuTensor,
+    n_rot: usize,
+    d: usize,
+    start: usize,
+    cos: &GpuTensor,
+    sin: &GpuTensor,
+) -> Result<GpuTensor> {
+    let out = gpu.alloc(x.shape());
+    let mut rec = gpu.rec();
+    rec.copy(&x.buffer, 0, &out.buffer, crate::gpu::byte_size(x.len()));
+    rope_into(&mut rec, &out, n_rot, d, start, cos, sin)?;
+    rec.submit();
+    Ok(out)
+}
+
+/// `rope` recorded into `rec`, in place on `x` (each invocation owns one pair, so in place is
+/// safe; the workspace path rotates its qkv buffer without a second one).
+pub fn rope_into(
+    rec: &mut Rec,
+    x: &GpuTensor,
+    n_rot: usize,
+    d: usize,
+    start: usize,
+    cos: &GpuTensor,
+    sin: &GpuTensor,
+) -> Result<()> {
+    let (t, w) = shape::rope(x.shape(), n_rot, d, start, cos.shape(), sin.shape())?;
+    let n = len_u32(t * n_rot * (d / 2))?;
+    len_u32(numel(cos.shape()))?;
+    if n == 0 {
+        return Ok(());
+    }
+    let params = RopeParams {
+        n,
+        w: w as u32,
+        half: (d / 2) as u32,
+        start: start as u32,
+        n_rot: n_rot as u32,
+        _pad: [0; 3],
+    };
+    let groups = elementwise_groups(n as usize, rec.gpu.max_groups());
+    rec.dispatch(
+        &rec.gpu.kernels.rope,
+        &[&x.buffer, &cos.buffer, &sin.buffer],
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+    )
+}
+
 /// Threads per side of `linear_naive`'s 2-D workgroup. Must match `@workgroup_size(16, 16)`.
 const NAIVE_TILE: usize = 16;
 
@@ -477,7 +603,23 @@ struct AttentionParams {
     scale: f32,
     start: u32,
     n_chunks: u32,
-    _pad: [u32; 2],
+    kv: u32,
+    group: u32,
+}
+
+/// Query heads and key/value heads (D71). Each key/value head serves `q / kv` query heads;
+/// GPT-2 has as many of each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heads {
+    pub q: usize,
+    pub kv: usize,
+}
+
+impl Heads {
+    /// Plain multi-head attention: every head has its own keys and values.
+    pub fn mha(n: usize) -> Self {
+        Heads { q: n, kv: n }
+    }
 }
 
 /// Shape of attention's per-chunk partials for `T` queries from `start` (D63):
@@ -488,14 +630,14 @@ pub fn attention_parts_shape(t: usize, start: usize, e: usize, n_head: usize) ->
     [t, n_head, (start + t).div_ceil(ATTENTION_CHUNK), d + 2]
 }
 
-/// `[T, 3E]` -> `(T, E)`, checking that 3E splits into 3 x `n_head` heads.
-fn qkv_dims(op: &str, qkv: &GpuTensor, n_head: usize) -> Result<(usize, usize)> {
-    let (t, e) = shape::qkv(op, qkv.shape(), n_head)?;
-    len_u32(t * 3 * e)?;
-    Ok((t, e))
+/// `[T, (q + 2 kv) d]` -> `(T, d)`, checking that the row splits into the heads.
+fn qkv_dims(op: &str, qkv: &GpuTensor, heads: Heads) -> Result<(usize, usize)> {
+    let (t, d) = shape::qkv_gqa(op, qkv.shape(), heads.q, heads.kv)?;
+    len_u32(numel(qkv.shape()))?;
+    Ok((t, d))
 }
 
-/// `[n_ctx, E]` cache buffers for `start + T` positions of width `e`.
+/// `[n_ctx, width]` cache buffers for `start + T` positions.
 fn check_cache(op: &str, k: &GpuTensor, v: &GpuTensor, e: usize, end: usize) -> Result<()> {
     let &[rows, ke] = k.shape() else {
         return Err(Error::Shape(format!(
@@ -519,7 +661,8 @@ fn check_cache(op: &str, k: &GpuTensor, v: &GpuTensor, e: usize, end: usize) -> 
     Ok(())
 }
 
-/// Write the K and V thirds of `qkv: [T, 3E]` into cache rows `start..start + T` (D32).
+/// Write the K and V thirds of `qkv: [T, 3E]` into cache rows `start..start + T` (D32), for
+/// as many key/value heads as query heads (the GPT-2 layout).
 pub fn kv_write(
     gpu: &Gpu,
     qkv: &GpuTensor,
@@ -528,22 +671,25 @@ pub fn kv_write(
     start: usize,
 ) -> Result<()> {
     let mut rec = gpu.rec();
-    kv_write_into(&mut rec, qkv, k_cache, v_cache, start)?;
+    kv_write_into(&mut rec, qkv, k_cache, v_cache, start, Heads::mha(1))?;
     rec.submit();
     Ok(())
 }
 
-/// `kv_write` recorded into `rec` (D61).
+/// `kv_write` recorded into `rec` (D61), for `qkv: [T, (q + 2 kv) d]`: the k and v parts go to
+/// caches `[n_ctx, kv d]` (D71).
 pub fn kv_write_into(
     rec: &mut Rec,
     qkv: &GpuTensor,
     k_cache: &GpuTensor,
     v_cache: &GpuTensor,
     start: usize,
+    heads: Heads,
 ) -> Result<()> {
-    let (t, e) = qkv_dims("kv_write", qkv, 1)?;
-    check_cache("kv_write", k_cache, v_cache, e, start + t)?;
-    if t == 0 || e == 0 {
+    let (t, d) = qkv_dims("kv_write", qkv, heads)?;
+    let (q, kv) = (heads.q * d, heads.kv * d);
+    check_cache("kv_write", k_cache, v_cache, kv, start + t)?;
+    if t == 0 || kv == 0 {
         return Ok(());
     }
     let kernel = &rec.gpu.kernels.kv_write;
@@ -551,7 +697,7 @@ pub fn kv_write_into(
         rec,
         kernel,
         &[&qkv.buffer, &k_cache.buffer, &v_cache.buffer],
-        Params4::new((t * e) as u32, e as u32, start as u32, 0),
+        Params4::new((t * kv) as u32, kv as u32, start as u32, q as u32),
         rec.gpu.max_groups(),
     )
 }
@@ -566,10 +712,24 @@ pub fn attention_cached(
     start: usize,
     n_head: usize,
 ) -> Result<GpuTensor> {
-    let (t, e) = qkv_dims("attention", qkv, n_head)?;
-    let parts = gpu.alloc(&attention_parts_shape(t, start, e, n_head));
+    attention_cached_gqa(gpu, qkv, k_cache, v_cache, start, Heads::mha(n_head))
+}
+
+/// `attention_cached` with grouped key/value heads (D71): `qkv: [T, (q + 2 kv) d]`, caches
+/// `[n_ctx, kv d]`. Returns `[T, q d]`.
+pub fn attention_cached_gqa(
+    gpu: &Gpu,
+    qkv: &GpuTensor,
+    k_cache: &GpuTensor,
+    v_cache: &GpuTensor,
+    start: usize,
+    heads: Heads,
+) -> Result<GpuTensor> {
+    let (t, d) = qkv_dims("attention", qkv, heads)?;
+    let e = heads.q * d;
+    let parts = gpu.alloc(&attention_parts_shape(t, start, e, heads.q));
     once(gpu, &[t, e], |rec, out| {
-        attention_into(rec, qkv, k_cache, v_cache, start, n_head, &parts, out)
+        attention_into(rec, qkv, k_cache, v_cache, start, heads, &parts, out)
     })
 }
 
@@ -583,16 +743,17 @@ pub fn attention_into(
     k_cache: &GpuTensor,
     v_cache: &GpuTensor,
     start: usize,
-    n_head: usize,
+    heads: Heads,
     parts: &GpuTensor,
     out: &GpuTensor,
 ) -> Result<()> {
-    let (t, e) = qkv_dims("attention", qkv, n_head)?;
-    check_cache("attention", k_cache, v_cache, e, start + t)?;
+    let n_head = heads.q;
+    let (t, d) = qkv_dims("attention", qkv, heads)?;
+    let (e, kv) = (heads.q * d, heads.kv * d);
+    check_cache("attention", k_cache, v_cache, kv, start + t)?;
     check_out("attention", out, &[t, e])?;
     let shape = attention_parts_shape(t, start, e, n_head);
     check_out("attention parts", parts, &shape)?;
-    let d = shape[3] - 2;
     if d > ATTENTION_MAX_D {
         return Err(Error::Shape(format!(
             "attention: head dimension {d} exceeds the kernel's {ATTENTION_MAX_D}"
@@ -616,7 +777,8 @@ pub fn attention_into(
         scale: 1.0 / (d as f32).sqrt(),
         start: start as u32,
         n_chunks: shape[2] as u32,
-        _pad: [0; 2],
+        kv: kv as u32,
+        group: (heads.q / heads.kv) as u32,
     };
     let params = bytemuck::bytes_of(&params);
     rec.dispatch(
@@ -636,10 +798,18 @@ pub fn attention_into(
 /// Causal multi-head attention from the fused `qkv: [T, 3E]` alone; returns `[T, E]`. Writes a
 /// temporary `[T, E]` cache and attends over it: the M2 op, now a special case of D31.
 pub fn causal_attention(gpu: &Gpu, qkv: &GpuTensor, n_head: usize) -> Result<GpuTensor> {
-    let (t, e) = qkv_dims("attention", qkv, n_head)?;
-    let (k, v) = (gpu.alloc(&[t, e]), gpu.alloc(&[t, e]));
-    kv_write(gpu, qkv, &k, &v, 0)?;
-    attention_cached(gpu, qkv, &k, &v, 0, n_head)
+    causal_attention_gqa(gpu, qkv, Heads::mha(n_head))
+}
+
+/// `causal_attention` with grouped key/value heads (D71): `qkv: [T, (q + 2 kv) d]`, returns
+/// `[T, q d]`.
+pub fn causal_attention_gqa(gpu: &Gpu, qkv: &GpuTensor, heads: Heads) -> Result<GpuTensor> {
+    let (t, d) = qkv_dims("attention", qkv, heads)?;
+    let (k, v) = (gpu.alloc(&[t, heads.kv * d]), gpu.alloc(&[t, heads.kv * d]));
+    let mut rec = gpu.rec();
+    kv_write_into(&mut rec, qkv, &k, &v, 0, heads)?;
+    rec.submit();
+    attention_cached_gqa(gpu, qkv, &k, &v, 0, heads)
 }
 
 /// A copy of `x` made by a kernel, 16 bytes per load and store: the bandwidth probe (D41). The

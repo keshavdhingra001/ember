@@ -54,19 +54,6 @@ pub(crate) fn layer_norm(x: &[usize], gain: &[usize], bias: &[usize]) -> Result<
     Ok((rows, cols))
 }
 
-/// `qkv: [T, 3E]` that splits into 3 x `n_head` heads -> `(T, E)`.
-pub(crate) fn qkv(op: &str, qkv: &[usize], n_head: usize) -> Result<(usize, usize)> {
-    let &[t, three_e] = qkv else {
-        return Err(Error::Shape(format!("{op}: qkv {qkv:?} must be 2-D")));
-    };
-    if n_head == 0 || three_e % (3 * n_head) != 0 {
-        return Err(Error::Shape(format!(
-            "{op}: qkv {qkv:?} doesn't split into 3 x {n_head} heads"
-        )));
-    }
-    Ok((t, three_e / 3))
-}
-
 /// `qkv: [T, (H + 2 KV) d]` for H query heads sharing KV key/value heads (D71). Returns
 /// `(T, d)`.
 pub(crate) fn qkv_gqa(

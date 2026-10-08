@@ -1063,6 +1063,12 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
   its outputs must stay bit-for-bit the same (tested).
 - **Alternatives:** a second attention kernel; expanding K and V to all heads (3× the cache and
   the reads).
+- **Built (§3):** `ops::Heads { q, kv }` goes to `kv_write_into` and `attention_into`; the
+  kernels take the cache row width and the group size where they had padding. GPT-2's GPU
+  output is bit-identical before and after (a 70-token forward plus 9 cached decode steps,
+  3.97 M floats compared with `cmp`). Tested against the CPU for 9/3, 6/2, 4/1 and 4/4 heads
+  across chunk boundaries (worst 7.8e-7 absolute), and bitwise for a 50-row prefill followed
+  by 20 decode steps against one 70-row pass.
 
 ### D72: Fused projection matrices
 - **What:** at load, q, k and v become one `[E, (n_head + 2 n_kv_head) d]` matrix and gate
@@ -1074,6 +1080,11 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
   projection adds the residual in its epilogue (D62).
 - **Alternatives:** SwiGLU as a matmul epilogue (each thread would need its gate and up
   columns together); deferred until a profile says it matters.
+- **Built (§3):** `rms_norm.wgsl` (with `reduce.wgsl`), `silu_mul.wgsl`, and `rope.wgsl`, which
+  rotates in place (one invocation per pair, reading both halves before writing either), so
+  the workspace needs no second qkv buffer. Worst errors against the CPU: RMSNorm 4.8e-7
+  (CPU in f64), SiLU-multiply 8.7e-7 relative (exp differs by a few ulp), RoPE 2.4e-7 (a
+  driver may fuse `a c - b s` into an fma). Value heads pass through RoPE bit for bit.
 
 ### D74: `src/llama/` beside `src/gpt2/`, shared ops and cache
 - **What:** config, weights, CPU forward and GPU forward per model; the KV cache and workspace
