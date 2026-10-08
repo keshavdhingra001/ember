@@ -17,6 +17,7 @@ use ember::gpt2::gpu as gpt2_gpu;
 use ember::llama::{self, gpu as llama_gpu};
 use ember::profile::{self, KernelTime};
 use ember::rng::Rng;
+use ember::tokenizer::Piece;
 use ember::{Gpu, GpuTensor, Tensor, Tokenizer, cpu, ops};
 
 const USAGE: &str = "usage: ember [info | selftest | tokenize [--model M] <text>\n              | generate [--model M] [--cpu | --no-cache] [-n <tokens>] <prompt>\n              | bench [--model M] [-n <tokens>] <prompt>\n              | profile [--model M] [-n <runs>] <prompt>\n              | matmul [-n <runs>]]\n       M: gpt2 (default) | smollm2-135m | smollm2-360m";
@@ -198,16 +199,18 @@ fn selftest() -> CliResult {
     Ok(())
 }
 
-/// Print each pre-split word and the tokens BPE made of it. (Special tokens such as
-/// `<|im_start|>` are matched before the split, so here they show up as plain text.)
+/// Print each special token and each pre-split word with the tokens BPE made of it: the
+/// same pieces `encode` uses, so the count is the count `generate` feeds the model.
 fn tokenize(args: &[String]) -> CliResult {
     let o = prompt_opts(args, 0, &[])?;
     let (_, tok) = load_tokenizer(&o.model)?;
-    let text = o.prompt.as_str();
     let mut total = 0;
-    for word in tok.split(text)? {
-        let ids = tok.encode(word)?;
-        let pieces: Vec<String> = ids
+    for piece in tok.pieces(&o.prompt)? {
+        let (text, ids) = match piece {
+            Piece::Special(text, id) => (text, vec![id]),
+            Piece::Word(word) => (word, tok.encode(word)?),
+        };
+        let shown: Vec<String> = ids
             .iter()
             .map(|&id| {
                 format!(
@@ -216,7 +219,7 @@ fn tokenize(args: &[String]) -> CliResult {
                 )
             })
             .collect();
-        println!("{word:?} -> {}", pieces.join(" "));
+        println!("{text:?} -> {}", shown.join(" "));
         total += ids.len();
     }
     println!("{total} tokens");

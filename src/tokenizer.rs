@@ -54,6 +54,13 @@ pub struct Tokenizer {
     special: Vec<(String, u32)>,
 }
 
+/// A piece of the input before BPE: a special token, already an id (D75), or a pre-split word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Piece<'t> {
+    Special(&'t str, u32),
+    Word(&'t str),
+}
+
 impl Tokenizer {
     /// Load `vocab.json` and `merges.txt` from a Hugging Face model directory.
     pub fn load(dir: &Path) -> Result<Self> {
@@ -239,28 +246,32 @@ impl Tokenizer {
     /// Face does (D75).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut out = Vec::new();
+        for piece in self.pieces(text)? {
+            match piece {
+                Piece::Special(_, id) => out.push(id),
+                Piece::Word(word) => out.extend(self.bpe(word.as_bytes())),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Steps 0 and 1: special tokens cut out whole (earliest first, the longest at one
+    /// position; none with [`Tokenizer::load`]), and the text between them pre-split into
+    /// words. `encode` is BPE over each word. Public so `ember tokenize` can show it.
+    pub fn pieces<'t>(&self, text: &'t str) -> Result<Vec<Piece<'t>>> {
+        let mut out = Vec::new();
         let mut rest = text;
         while !rest.is_empty() {
-            // The earliest special token in `rest`; at one position, the longest.
             let next = self
                 .special
                 .iter()
                 .filter_map(|(s, id)| rest.find(s.as_str()).map(|at| (at, s.len(), *id)))
                 .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-            let (plain, special) = match next {
-                Some((at, len, id)) => (&rest[..at], Some((id, at + len))),
-                None => (rest, None),
-            };
-            for word in self.split(plain)? {
-                out.extend(self.bpe(word.as_bytes()));
-            }
-            match special {
-                Some((id, end)) => {
-                    out.push(id);
-                    rest = &rest[end..];
-                }
-                None => break,
-            }
+            let plain = next.map_or(rest, |(at, ..)| &rest[..at]);
+            out.extend(self.split(plain)?.into_iter().map(Piece::Word));
+            let Some((at, len, id)) = next else { break };
+            out.push(Piece::Special(&rest[at..at + len], id));
+            rest = &rest[at + len..];
         }
         Ok(out)
     }
@@ -516,6 +527,10 @@ mod tests {
         assert_eq!(t.encode("<s><s>x").unwrap(), [260, 261]);
         // A near miss is plain text, byte by byte here.
         assert_eq!(t.encode("<s").unwrap(), [u32::from(b'<'), u32::from(b's')]);
+        assert_eq!(
+            t.pieces("ab<s>x").unwrap(),
+            [Piece::Word("ab"), Piece::Special("<s>x", 261)]
+        );
         // Without load_hf there are no special tokens (D11).
         assert_ne!(toy().encode("<s>").unwrap(), [260]);
     }
