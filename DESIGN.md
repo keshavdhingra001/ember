@@ -1128,3 +1128,67 @@ architecture, E = 576, 30 layers, 9 query heads and 3 key/value heads of d = 64,
   size against the device's limits first and return an error. Bounding the partials (a
   prefill cut into chunks of rows, so the buffer is `rows_max × heads × chunks × (d + 2)`) is
   left for when a long-context run needs it.
+
+### D77: M8 results (measured 2026-10-10)
+- **Method:** one binary (`e121f2f`), `ember bench -n 32` and `ember profile` for GPT-2 and
+  SmolLM2-135M on "I enjoy walking with my cute dog" (7 tokens in both tokenizers), 3 rounds,
+  the four jobs in rotating order. Each job started only on AC power, with no other cargo job
+  and a load average under 2 (checked by the script); each number is itself a median of 5
+  after a warm-up, and the table gives the median of the 3 rounds. The read roof is
+  `ember matmul`'s `read_peak` in the same session. Raw output: `target/tmp/m8/bench.out`
+  (not committed).
+
+| median of 3 rounds | GPT-2 124M | SmolLM2-135M |
+|---|---|---|
+| weights read per decode step | 495 MB | 538 MB (+9%) |
+| dispatches per step | 111 | 333 |
+| decode tokens/s (`bench`) | 38.9 | 30.1 (−23%) |
+| 7-token prefill ms (`bench`) | 29.2 | 37.4 |
+| decode step: GPU ms, all kernels | 22.3 | 23.9 (+7%) |
+| decode step: wall ms | 26.2 | 33.3 |
+| decode step: outside kernels ms | 3.9 | 9.3 |
+| linear kernels, GB/s of weights (% of 27.1 GB/s read roof) | 22.1 (82%) | 22.5 (83%) |
+| attention at position 1000, ms | 5.0 | 9.2 |
+| decode step at position 1000, wall ms | 30.1 | 41.2 |
+
+SmolLM2-135M decode step at position 7, per kernel (median of 3 rounds; GPU ms):
+`matvec` (gate|up, 30 calls) 7.59, `matvec_wide` (the LM head, 113 MB) 6.36,
+`matvec_split+res` (o and down with the residual, 60) 5.31, `matvec_split` (q|k|v, 30) 2.17,
+`attention` 0.87, `rms_norm` (61) 0.50, `attention_combine` 0.14, `rope` 0.13, `kv_write` 0.11, `silu_mul` 0.11, `gather`
+0.01. The linear kernels are 21.4 of the 23.9 GPU ms (90%) and 64% of the wall time.
+
+- **The kernels did what the bytes say:** 9% more weights, 7% more GPU time; the matrix-vector
+  kernels stream at 83% of the read roof, the same as GPT-2's 82%. The new kernels (RMSNorm,
+  RoPE, SiLU-multiply, the gather) are 0.75 ms together.
+- **Miss 1, time outside the kernels:** 9.3 ms against GPT-2's 3.9, and it is most of the gap
+  (33.3 − 26.2 = 7.1 ms per step, 5.4 of it outside the kernels). The step records 333
+  dispatches against 111 (30 layers of 11 against 12 of 9), so about 24 µs per extra dispatch
+  of recording, binding and submission. That per-dispatch cost is an inference from the two
+  totals, not a measurement of its parts (D66 left the same question open). The obvious
+  remedy is fewer dispatches: RoPE and kv_write as the q|k|v matmul's epilogue, SiLU-multiply
+  as the gate|up matmul's (D73 deferred this "until a profile says it matters"; this is that
+  profile), which would remove 90 of the 333.
+- **Miss 2, attention does not profit from grouped-query attention:** at position 1000 it takes
+  9.2 ms against GPT-2's 5.0, the ratio of query heads × layers (270 against 144), although the
+  cache is 3× smaller per head. The kernel runs one workgroup per (query row, query head,
+  chunk), so the 3 query heads of a group each read their shared K and V chunk separately: the
+  cache shrinks, the reads don't. One workgroup per key/value head serving its whole group would
+  read each chunk once. Not built.
+- **Per matrix, the 83% average hides two populations.** The block matrices stream at or above
+  the read roof: gate|up 212 MB in 7.59 ms = 28.0 GB/s, q|k|v 66 MB in 2.17 ms = 30.6 GB/s, o
+  and down 146 MB in 5.31 ms = 27.5 GB/s (so `read_peak`'s 27.1 GB/s is a floor for the real
+  peak, not a ceiling; M6 measured 29.6). The LM head is the laggard: 113 MB in 6.36 ms = 17.8
+  GB/s, 66% of the roof, the `matvec_wide` path for a 49152-wide output (GPT-2's: 17.4 GB/s).
+  It is 27% of the GPU time for 21% of the bytes.
+- **GPT-2 against D66:** 38.9 tokens/s today against 42.0 in M7. GPT-2's output is bit-identical
+  through M8, but its code moved onto `src/cache.rs` and its kernels gained GQA arithmetic, so
+  the M7 binary (`73216d0`, a worktree build) and this one ran `bench -n 32` on GPT-2 in 4
+  alternating pairs, same gate (`target/tmp/m8/pair.out`). Decode: M7 25.0–25.5 ms (median
+  25.15, 39.8 tokens/s), M8 25.2–25.9 ms (median 25.65, 39.0 tokens/s). Prefill: 28.4 against
+  29.2 ms (medians). So most of the 42.0 → 38.9 is the session (the M7 binary itself gives
+  39.8 today; D66 was measured under load, and battery, temperature and driver state differ
+  between sessions). M8 itself costs GPT-2 about 0.5 ms per token (2%): smaller than the
+  ±5% between sessions, but M8 was slower in all 4 pairs, so it is likely real. Not located:
+  the dispatch count is the same 111; candidates are the attention kernel's extra index
+  arithmetic (`h / group`, the row width from `kv`) and the shared cache's bounds checks.
+  Unverified.
